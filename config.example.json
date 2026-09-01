@@ -1,0 +1,21 @@
+{
+  "rcon_host": "127.0.0.1",
+  "rcon_port": 25575,
+  "rcon_password": "change-me",
+  "player_name": "IAmBoreder",
+  "active_player_file": "state/active_player.txt",
+  "event_host": "127.0.0.1",
+  "event_port": 8765,
+  "event_token": "",
+  "state_file": "state/god_state.json",
+  "dry_run": false,
+  "max_command_length": 512,
+  "camera_output_dir": "state/captures",
+  "camera_plugin_render_dir": "plugins/SpectatorCamera/renders",
+  "camera_timeout": 120,
+  "structure_catalog_file": "state/structure_catalog.json",
+  "structure_datapacks_dir": "server/world/datapacks",
+  "structure_download_dir": "state/structure_downloads",
+  "structure_max_download_mb": 64,
+  "minecraft_version": "26.2"
+}

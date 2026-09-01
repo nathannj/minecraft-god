@@ -1,0 +1,19 @@
+name: MinecraftGodBridge
+version: ${version}
+main: com.minecraftgod.bridge.MinecraftGodPlugin
+api-version: '26.2'
+description: Sends selected Minecraft events to the local Minecraft God MCP bridge.
+author: MinecraftGod
+commands:
+  godscan:
+    description: Return exact nearby blocks, signs, and entity positions for the Minecraft God.
+    usage: /godscan <player> [radius] [vertical-radius]
+    permission: minecraftgod.scan
+  godcheck:
+    description: Return exact block properties at a coordinate for the Minecraft God.
+    usage: /godcheck <player> <x> <y> <z>
+    permission: minecraftgod.scan
+permissions:
+  minecraftgod.scan:
+    description: Allow the bridge to inspect a local scene.
+    default: op

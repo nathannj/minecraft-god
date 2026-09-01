@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minecraft-god-bridge"
+version = "0.1.0"
+description = "A local MCP bridge that gives Codex controlled supernatural access to a Minecraft server."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+minecraft-god = "god_bridge.mcp_server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

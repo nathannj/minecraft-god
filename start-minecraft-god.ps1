@@ -1,0 +1,60 @@
+$ErrorActionPreference = "Stop"
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ServerDir = Join-Path $Root "server"
+Set-Location $Root
+
+$paperJar = Join-Path $ServerDir "paper.jar"
+$eulaFile = Join-Path $Root "eula.txt"
+$pluginJar = Join-Path $Root "plugins\MinecraftGodBridge.jar"
+$javaPathFile = Join-Path $ServerDir "java-path.txt"
+if (-not (Test-Path $paperJar) -or -not (Test-Path $pluginJar)) {
+    throw "The server is not set up yet. Run .\setup-minecraft-god.ps1 first."
+}
+if (-not (Test-Path $eulaFile) -or -not ((Get-Content -Raw -LiteralPath $eulaFile) -match "eula=true")) {
+    throw "The Minecraft EULA is not accepted. Run .\setup-minecraft-god.ps1 -AcceptEula first."
+}
+$javaExe = if (Test-Path $javaPathFile) { (Get-Content -Raw -LiteralPath $javaPathFile).Trim() } else { (Get-Command java).Source }
+if (-not (Test-Path $javaExe)) { throw "The configured Java runtime was not found. Run setup again." }
+
+$env:MINECRAFT_RCON_PASSWORD_FILE = Join-Path $ServerDir "rcon-password.txt"
+$env:MINECRAFT_PLAYER = (Get-Content -Raw -LiteralPath (Join-Path $ServerDir "god-player.txt")).Trim()
+$env:MINECRAFT_ACTIVE_PLAYER_FILE = Join-Path $Root "state\active_player.txt"
+$env:MINECRAFT_STATE_FILE = Join-Path $Root "state\god_state.json"
+$env:MINECRAFT_EVENT_BASE_URL = "http://127.0.0.1:8765"
+$npmCodex = Join-Path $env:APPDATA "npm\codex.cmd"
+if (Test-Path $npmCodex) { $env:CODEX_CLI_PATH = $npmCodex }
+$readyFile = Join-Path $Root "logs\god-controller.ready"
+Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue
+$env:MINECRAFT_GOD_READY_FILE = $readyFile
+
+$hubOut = Join-Path $Root "logs\event-hub.out.log"
+$hubErr = Join-Path $Root "logs\event-hub.err.log"
+$godOut = Join-Path $Root "logs\god-controller.out.log"
+$godErr = Join-Path $Root "logs\god-controller.err.log"
+
+$hub = Start-Process -FilePath (Get-Command py).Source -ArgumentList @("-3", "-m", "god_bridge.event_hub") -WorkingDirectory $Root -WindowStyle Hidden -RedirectStandardOutput $hubOut -RedirectStandardError $hubErr -PassThru
+try {
+    $ready = $false
+    for ($i = 0; $i -lt 40; $i++) {
+        try { Invoke-WebRequest -Uri "http://127.0.0.1:8765/healthz" -UseBasicParsing -TimeoutSec 1 | Out-Null; $ready = $true; break } catch { Start-Sleep -Milliseconds 250 }
+    }
+    if (-not $ready) { throw "The event hub did not start. Check logs\event-hub.err.log." }
+
+    $controller = Start-Process -FilePath (Get-Command py).Source -ArgumentList @("-3", "-m", "god_bridge.controller") -WorkingDirectory $Root -WindowStyle Hidden -RedirectStandardOutput $godOut -RedirectStandardError $godErr -PassThru
+    try {
+        $godReady = $false
+        for ($i = 0; $i -lt 180; $i++) {
+            if (Test-Path $readyFile) { $godReady = $true; break }
+            if ($controller.HasExited) { throw "The god controller stopped. Check logs\god-controller.err.log." }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $godReady) { throw "The god controller did not become ready. Check logs\god-controller.err.log." }
+        Write-Host "God controller is waiting for any player to join. The first player becomes active for this session."
+        Write-Host "Starting Paper server. Connect from Minecraft Java Edition to localhost:25565."
+        & $javaExe -Xms4G -Xmx4G -jar $paperJar --nogui
+    } finally {
+        if ($controller -and -not $controller.HasExited) { Stop-Process -Id $controller.Id -Force -ErrorAction SilentlyContinue }
+    }
+} finally {
+    if ($hub -and -not $hub.HasExited) { Stop-Process -Id $hub.Id -Force -ErrorAction SilentlyContinue }
+}

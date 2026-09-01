@@ -1,0 +1,16 @@
+{
+  "name": "minecraftaigod",
+  "version": "1.0.0",
+  "description": "This is the first playable bridge for **“I let an AI be GOD in my Minecraft world.”** It gives Codex an MCP tool surface backed by a local Minecraft server's RCON port, plus a small HTTP endpoint where a Paper plugin can send chat and gameplay events.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}
