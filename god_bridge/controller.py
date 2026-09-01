@@ -18,6 +18,8 @@ from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .ledger import GodLedger
+
 
 ROOT = Path(__file__).resolve().parents[1]
 GOD_PROMPT = (ROOT / "prompts" / "god_system.md").read_text(encoding="utf-8")
@@ -236,7 +238,9 @@ def _event_for_turn(pending_events: deque[dict[str, Any]]) -> dict[str, Any] | N
 
 
 def turn_text(event: dict[str, Any] | None, first_join: bool = False, idle: bool = False, player_name: str = "", player_id: str = "") -> str:
-    if first_join:
+    if first_join and event and event.get("type") == "god_resume":
+        opening = "THE GOD CONTROLLER JUST RESTARTED. Your player may still be online. Re-establish your private context by observing the world, then decide whether to speak or intervene."
+    elif first_join:
         opening = "THE PLAYER JUST JOINED THE WORLD. This is your first trigger. Begin by observing the world, then decide whether to speak or intervene."
     elif idle:
         opening = "CONTROL TICK: no new dramatic event was reported. Decide whether observation or silence is the right action."
@@ -359,6 +363,27 @@ def main() -> None:
         print(f"[god] Waiting for players to join; ignoring {cursor} old events", file=sys.stderr)
         ready_file.parent.mkdir(parents=True, exist_ok=True)
         ready_file.write_text("ready\n", encoding="utf-8")
+        ledger_path = Path(os.getenv("MINECRAFT_LEDGER_FILE", str(ROOT / "state" / "god_ledger.sqlite3")))
+        try:
+            existing_players = GodLedger(ledger_path).players()
+        except Exception as exc:
+            existing_players = []
+            print(f"[god] could not load existing player profiles: {exc}", file=sys.stderr)
+        for profile in existing_players:
+            if not profile.get("online") or len(sessions) >= max_gods:
+                continue
+            player_id = str(profile.get("player_id", "")).strip().lower()
+            player_name = str(profile.get("name", "")).strip()
+            if not player_id or not player_name:
+                continue
+            try:
+                session = GodSession(player_id, player_name, ROOT, transcript, idle_seconds)
+                sessions[player_id] = session
+                session.enqueue({"type": "god_resume", "player": player_name, "player_uuid": player_id}, first_join=True)
+                transcript.write("controller_resume", {"player_id": player_id, "player": player_name})
+                print(f"[god] resumed the personal god of {player_name}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[god] could not resume {player_name}: {exc}", file=sys.stderr)
         while True:
             try:
                 payload = fetch_events(event_url, cursor)

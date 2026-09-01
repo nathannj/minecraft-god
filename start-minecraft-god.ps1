@@ -56,6 +56,11 @@ try {
         & $javaExe -Xms4G -Xmx4G -jar $paperJar --nogui
     } finally {
         if ($controller -and -not $controller.HasExited) { Stop-Process -Id $controller.Id -Force -ErrorAction SilentlyContinue }
+        # Also clean up a controller that may have been restarted independently
+        # while this launcher kept the Paper server alive.
+        Get-CimInstance Win32_Process | Where-Object {
+            $_.CommandLine -match 'god_bridge\.controller' -and $_.CommandLine -match 'python|py\.exe'
+        } | ForEach-Object { & taskkill.exe /PID $_.ProcessId /T /F | Out-Null }
     }
 } finally {
     if ($hub -and -not $hub.HasExited) { Stop-Process -Id $hub.Id -Force -ErrorAction SilentlyContinue }

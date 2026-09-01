@@ -34,6 +34,8 @@ The launcher uses the npm-installed Codex CLI when available. This keeps the con
 
 Each dedicated God thread starts with `approvalPolicy = never` and full local access, and the controller automatically accepts approval requests from the `minecraft_god` MCP server. This is intentionally autonomous for this project; do not reuse these God threads for unrelated computer tasks.
 
+To reload the controller and its Codex god sessions without stopping Paper or disconnecting players, run `.\restart-god-controller.ps1` from this directory. It resumes profiles that the ledger still marks online and leaves the Minecraft server and event hub processes untouched.
+
 ## Track the live God session
 
 The readable live transcript is [`logs/god-session.log`](logs/god-session.log). Double-click `watch-god-session.cmd`, or run:
