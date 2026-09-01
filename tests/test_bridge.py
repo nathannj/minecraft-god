@@ -32,7 +32,10 @@ def test_god_actions_build_expected_commands(tmp_path):
     assert rcon.commands == ["execute as IAmBoreder at @s run summon minecraft:warden ~ ~ ~"]
 
     call_tool(bridge, "god_say", {"message": "You misunderstand."})
+    assert rcon.commands[-1].startswith("tellraw IAmBoreder ")
+    call_tool(bridge, "broadcast_to_world", {"message": "The skies open."})
     assert rcon.commands[-1].startswith("tellraw @a ")
+    assert "God of IAmBoreder" in rcon.commands[-1]
 
 
 def test_god_state_persists(tmp_path):

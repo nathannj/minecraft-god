@@ -684,17 +684,27 @@ class GodBridge:
             return self.get_god_state()
 
     def god_say(self, message: str) -> dict[str, Any]:
+        """Backward-compatible private speech to this god's own player."""
+        return self.god_whisper(message)
+
+    def god_broadcast(self, message: str) -> dict[str, Any]:
+        """Make an explicitly public, attributed pantheon announcement."""
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
         if len(message) > 256:
             raise ValueError("god message cannot exceed 256 characters")
-        tellraw = f"tellraw @a {{\"text\":{json.dumps(message)},\"color\":\"dark_purple\",\"bold\":true}}"
+        speaker = f"[God of {self.current_player_name()}] "
+        component = [
+            {"text": speaker, "color": "dark_purple", "bold": True},
+            {"text": message, "color": "light_purple"},
+        ]
+        tellraw = f"tellraw @a {json.dumps(component, separators=(',', ':'))}"
         result = self.execute(tellraw, allow_shared=True)
-        result["message"] = message
+        result.update({"message": message, "speaker": speaker, "public": True})
         return result
 
     def god_whisper(self, message: str) -> dict[str, Any]:
-        owner_id = self._require_owner()
+        owner_id = self._owner_id
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
         if len(message) > 256:
