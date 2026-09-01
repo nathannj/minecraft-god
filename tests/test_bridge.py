@@ -7,7 +7,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from god_bridge.bridge import BridgeConfig, GodBridge
-from god_bridge.mcp_server import call_tool, config_from_env, handle_request, start_event_server
+from god_bridge.mcp_server import call_tool, config_from_env, handle_request, sign_line_width, start_event_server
 
 
 class FakeRcon:
@@ -118,6 +118,13 @@ def test_place_sign_builds_text_component_strings_and_verifies(tmp_path):
     assert result["ok"] is True
     assert "front_text:{messages:['LOOK CLOSER'" in rcon.commands[0]
     assert "data get block" in rcon.commands[1]
+
+
+def test_place_sign_rejects_lines_that_do_not_fit_the_physical_sign(tmp_path):
+    bridge, _ = make_bridge(tmp_path, dry_run=True)
+    with pytest.raises(ValueError, match="15 or fewer"):
+        call_tool(bridge, "place_sign", {"lines": ["This line is too long"]})
+    assert sign_line_width("I watched you") <= 90
 
 
 def test_sustained_abuse_triggers_an_immediate_consequence(tmp_path):

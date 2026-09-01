@@ -23,6 +23,43 @@ from typing import Any
 from .bridge import BridgeConfig, GodBridge, parse_identifier, parse_position
 
 
+SIGN_MAX_LINES = 4
+SIGN_MAX_CHARS = 15
+SIGN_MAX_PIXELS = 90
+
+# Approximate the widths of the vanilla bitmap font used by Java sign text.
+# The bridge deliberately errs on the short side: a sign should remain
+# readable in-game rather than merely fit in the NBT string.
+_SIGN_GLYPH_WIDTHS = {
+    " ": 4,
+    "i": 2,
+    "l": 2,
+    "I": 2,
+    "!": 2,
+    ".": 2,
+    ",": 2,
+    ":": 2,
+    ";": 2,
+    "'": 2,
+    "|": 2,
+    "t": 4,
+    "f": 4,
+    "j": 4,
+    "r": 4,
+    "m": 7,
+    "w": 7,
+    "M": 7,
+    "W": 7,
+}
+
+
+def sign_line_width(text: str) -> int:
+    """Return a conservative vanilla-font pixel width for one sign line."""
+    if not text:
+        return 0
+    return sum(_SIGN_GLYPH_WIDTHS.get(character, 5) + 1 for character in text) - 1
+
+
 def tool_definitions() -> list[dict[str, Any]]:
     return [
         {"name": "observe_world", "description": "Observe the configured player's telemetry, recent story context, and an exact local scene scan when the Paper bridge plugin supports it.", "inputSchema": {"type": "object", "properties": {}}},
@@ -49,7 +86,7 @@ def tool_definitions() -> list[dict[str, Any]]:
         {"name": "spawn_entity", "description": "Summon an entity at a Minecraft coordinate string; use '~ ~ ~' to summon near the configured player only when that is intended.", "inputSchema": {"type": "object", "properties": {"entity_type": {"type": "string"}, "position": {"type": "string", "default": "~ ~ ~"}, "nbt": {"type": "string", "default": ""}}, "required": ["entity_type"]}},
         {"name": "place_entity_on_block", "description": "Safely summon a named entity centered one block above an exact support block. The support must match and the target block plus head block must be air; the tool refuses to place an entity inside leaves, trees, walls, or water. The returned tag lets you address it reliably later.", "inputSchema": {"type": "object", "properties": {"entity_type": {"type": "string"}, "block_position": {"type": "string"}, "support_block": {"type": "string"}, "name": {"type": "string"}, "color": {"type": "string", "default": "gold"}, "tag": {"type": "string"}, "nbt": {"type": "string", "default": ""}, "no_ai": {"type": "boolean", "default": True}}, "required": ["entity_type", "block_position", "support_block", "name"]}},
         {"name": "move_entity_to_block", "description": "Move one tagged entity to the center one block above an exact support block, only when that block matches. Use the tag returned by place_entity_on_block.", "inputSchema": {"type": "object", "properties": {"tag": {"type": "string"}, "block_position": {"type": "string"}, "support_block": {"type": "string"}}, "required": ["tag", "block_position", "support_block"]}},
-        {"name": "place_sign", "description": "Place a readable four-line sign and verify its stored front text. Relative positions are anchored to the player; use an inspected position when the sign is part of the story.", "inputSchema": {"type": "object", "properties": {"position": {"type": "string", "default": "~ ~ ~1"}, "lines": {"type": "array", "items": {"type": "string", "maxLength": 60}, "minItems": 1, "maxItems": 4}, "rotation": {"type": "integer", "minimum": 0, "maximum": 15, "default": 0}, "material": {"type": "string", "default": "oak_sign"}, "color": {"type": "string", "default": "black"}, "glowing": {"type": "boolean", "default": False}}, "required": ["lines"]}},
+        {"name": "place_sign", "description": "Place a readable four-line Minecraft sign and verify its stored front text. Each line is limited to 15 characters and approximately 90 vanilla-font pixels; use short coherent phrases, not wrapped chat sentences. Relative positions are anchored to the player; use an inspected position when the sign is part of the story.", "inputSchema": {"type": "object", "properties": {"position": {"type": "string", "default": "~ ~ ~1"}, "lines": {"type": "array", "items": {"type": "string", "maxLength": 15}, "minItems": 1, "maxItems": 4}, "rotation": {"type": "integer", "minimum": 0, "maximum": 15, "default": 0}, "material": {"type": "string", "default": "oak_sign"}, "color": {"type": "string", "default": "black"}, "glowing": {"type": "boolean", "default": False}}, "required": ["lines"]}},
         {"name": "give_item", "description": "Give an item stack to a player.", "inputSchema": {"type": "object", "properties": {"item": {"type": "string"}, "amount": {"type": "integer", "minimum": 1, "maximum": 2304, "default": 1}, "player": {"type": "string"}}, "required": ["item"]}},
         {"name": "set_weather", "description": "Set clear, rain, or thunder for a duration in seconds.", "inputSchema": {"type": "object", "properties": {"weather": {"type": "string", "enum": ["clear", "rain", "thunder"]}, "duration": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 600}}, "required": ["weather"]}},
         {"name": "set_time", "description": "Set Minecraft time using day, noon, night, midnight, or a numeric tick value.", "inputSchema": {"type": "object", "properties": {"time": {"type": "string"}}, "required": ["time"]}},
@@ -168,8 +205,14 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
     if name == "place_sign":
         position = parse_position(args.get("position", "~ ~ ~1"))
         lines = args.get("lines")
-        if not isinstance(lines, list) or not 1 <= len(lines) <= 4 or not all(isinstance(line, str) and len(line) <= 60 for line in lines):
-            raise ValueError("lines must be an array of one to four strings, each at most 60 characters")
+        if not isinstance(lines, list) or not 1 <= len(lines) <= SIGN_MAX_LINES or not all(isinstance(line, str) for line in lines):
+            raise ValueError(f"lines must be an array of one to {SIGN_MAX_LINES} strings")
+        for index, line in enumerate(lines, start=1):
+            if len(line) > SIGN_MAX_CHARS:
+                raise ValueError(f"sign line {index} is {len(line)} characters; shorten it to {SIGN_MAX_CHARS} or fewer")
+            width = sign_line_width(line)
+            if width > SIGN_MAX_PIXELS:
+                raise ValueError(f"sign line {index} is approximately {width} pixels wide; shorten it to {SIGN_MAX_PIXELS} pixels or fewer")
         material = parse_identifier(str(args.get("material", "oak_sign")), "material")
         color = parse_identifier(str(args.get("color", "black")), "color")
         rotation = max(0, min(int(args.get("rotation", 0)), 15))
