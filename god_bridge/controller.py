@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from itertools import islice
 from pathlib import Path
@@ -65,10 +66,13 @@ class Transcript:
 
 
 class CodexAppServer:
-    def __init__(self, cwd: Path, transcript: Transcript) -> None:
+    def __init__(self, cwd: Path, transcript: Transcript, environment: dict[str, str] | None = None) -> None:
         self.transcript = transcript
         # Prefer the npm-installed CLI because the desktop bundle can lag behind model availability.
         codex_bin = os.getenv("CODEX_CLI_PATH") or shutil.which("codex.cmd") or shutil.which("codex") or shutil.which("codex.exe") or "codex"
+        process_environment = os.environ.copy()
+        if environment:
+            process_environment.update(environment)
         self.process = subprocess.Popen(
             # The normal desktop notification hook receives the full turn
             # payload. On Windows that can exceed the command-line limit;
@@ -78,6 +82,7 @@ class CodexAppServer:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=process_environment,
             text=True,
             encoding="utf-8",
             bufsize=1,
@@ -230,7 +235,7 @@ def _event_for_turn(pending_events: deque[dict[str, Any]]) -> dict[str, Any] | N
     return {"type": "event_batch", "events": events}
 
 
-def turn_text(event: dict[str, Any] | None, first_join: bool = False, idle: bool = False) -> str:
+def turn_text(event: dict[str, Any] | None, first_join: bool = False, idle: bool = False, player_name: str = "", player_id: str = "") -> str:
     if first_join:
         opening = "THE PLAYER JUST JOINED THE WORLD. This is your first trigger. Begin by observing the world, then decide whether to speak or intervene."
     elif idle:
@@ -238,51 +243,123 @@ def turn_text(event: dict[str, Any] | None, first_join: bool = False, idle: bool
     else:
         opening = "A new Minecraft event has arrived. Read the current world before deciding what, if anything, to do."
     event_json = json.dumps(event, indent=2) if event else "(none)"
-    return f"{opening}\n\nEVENT(S):\n{event_json}\n\nYou are always watching, even when silent. Observe the live world before deciding, and re-observe immediately before any location-sensitive action because the player can move while you reason. Never issue a route or coordinate and then perform a delayed action against the old position. Keep travel instructions to one exact, bounded step; after a long action, wait for a confirming event. Do not send a status update merely to announce that you are thinking. Do not narrate a plan instead of acting; either take a confirmed action, or deliberately choose silence."
+    identity = f"\n\nIDENTITY: You are the personal god of {player_name or 'your assigned player'} ({player_id or 'legacy session'}). You may directly affect only that player. The bridge enforces this boundary. Other gods are independent agents; communicate with them and request permission rather than attempting to target their players."
+    return f"{opening}{identity}\n\nEVENT(S):\n{event_json}\n\nYou are always watching, even when silent. Observe the live world before deciding, and re-observe immediately before any location-sensitive action because the player can move while you reason. Never issue a route or coordinate and then perform a delayed action against the old position. Keep travel instructions to one exact, bounded step; after a long action, wait for a confirming event. Do not send a status update merely to announce that you are thinking. Do not narrate a plan instead of acting; either take a confirmed action, or deliberately choose silence."
+
+
+def _event_targets(event: dict[str, Any], player_id: str, player_name: str) -> bool:
+    for key in ("player_uuid", "victim_uuid", "killer_uuid", "target_player_id", "from_player_id", "to_player_id"):
+        if str(event.get(key, "")).casefold() == player_id.casefold():
+            return True
+    return any(player_name and str(event.get(key, "")).casefold() == player_name.casefold() for key in ("player", "victim", "killer", "target"))
+
+
+class GodSession:
+    """One persistent Codex thread and one scoped MCP environment for a player."""
+
+    def __init__(self, player_id: str, player_name: str, root: Path, transcript: Transcript, idle_seconds: float) -> None:
+        self.player_id = player_id
+        self.player_name = player_name
+        self.transcript = transcript
+        self.idle_seconds = idle_seconds
+        self.codex = CodexAppServer(root, transcript, {
+            "MINECRAFT_GOD_PLAYER_ID": player_id,
+            "MINECRAFT_GOD_PLAYER": player_name,
+            "MINECRAFT_EVENTS_FILE": str(root / "state" / "events.jsonl"),
+            "MINECRAFT_LEDGER_FILE": str(root / "state" / "god_ledger.sqlite3"),
+            "MINECRAFT_PROFILE_DIR": str(root / "state" / "players"),
+            "MINECRAFT_STATE_FILE": str(root / "state" / "players" / player_id / "god_state.json"),
+        })
+        self.thread_id = ""
+        self._pending: deque[dict[str, Any]] = deque(maxlen=64)
+        self._condition = threading.Condition()
+        self._stopping = False
+        self._active_turn = False
+        self._first_join_pending = False
+        self._last_turn_at = time.monotonic()
+        self._start_codex()
+        self._worker = threading.Thread(target=self._run, name=f"god-{player_name}", daemon=True)
+        self._worker.start()
+
+    def _start_codex(self) -> None:
+        self.codex.request("initialize", {"clientInfo": {"name": "minecraft_god_controller", "title": "Minecraft God Controller", "version": "0.2.0"}})
+        self.codex.notify("initialized")
+        thread = self.codex.request("thread/start", {
+            "cwd": str(ROOT),
+            "model": os.getenv("MINECRAFT_GOD_MODEL", "gpt-5.6-luna"),
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+        })
+        self.thread_id = thread["thread"]["id"]
+        try:
+            self.codex.request("thread/name/set", {"threadId": self.thread_id, "name": f"God of {self.player_name}"})
+        except Exception as exc:
+            print(f"[god:{self.player_name}] could not name Codex thread: {exc}", file=sys.stderr)
+        print(f"[god:{self.player_name}] Codex thread ready: {self.thread_id}", file=sys.stderr)
+
+    def enqueue(self, event: dict[str, Any], *, first_join: bool = False) -> None:
+        with self._condition:
+            self._pending.append(event)
+            self._first_join_pending = self._first_join_pending or first_join
+            self._condition.notify()
+
+    def _drain_notifications(self) -> None:
+        while True:
+            try:
+                notification = self.codex.notifications.get_nowait()
+            except queue.Empty:
+                return
+            if notification.get("method") == "turn/completed":
+                self._active_turn = False
+
+    def _run(self) -> None:
+        while not self._stopping and self.codex.process.poll() is None:
+            self._drain_notifications()
+            if self._active_turn:
+                time.sleep(0.2)
+                continue
+            with self._condition:
+                idle = time.monotonic() - self._last_turn_at >= self.idle_seconds
+                if not self._pending and not idle:
+                    self._condition.wait(timeout=0.5)
+                    continue
+                event = _event_for_turn(self._pending) if self._pending else None
+                first_join = self._first_join_pending
+                self._first_join_pending = False
+            self._active_turn = True
+            self._last_turn_at = time.monotonic()
+            self.transcript.write("turn_start", {"player_id": self.player_id, "player": self.player_name, "event": event, "idle": event is None})
+            try:
+                prompt = GOD_PROMPT + "\n\n" if first_join else ""
+                self.codex.request("turn/start", {"threadId": self.thread_id, "input": [{"type": "text", "text": prompt + turn_text(event, first_join=first_join, idle=event is None, player_name=self.player_name, player_id=self.player_id)}]})
+            except Exception as exc:
+                self._active_turn = False
+                print(f"[god:{self.player_name}] turn failed: {exc}", file=sys.stderr)
+
+    def close(self) -> None:
+        self._stopping = True
+        with self._condition:
+            self._condition.notify_all()
+        self.codex.close()
+
+
+def _stable_player_id(name: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"minecraft-god:{name.casefold()}"))
 
 
 def main() -> None:
     event_url = os.getenv("MINECRAFT_EVENT_BASE_URL", "http://127.0.0.1:8765")
     idle_seconds = float(os.getenv("MINECRAFT_GOD_IDLE_SECONDS", "45"))
     ready_file = Path(os.getenv("MINECRAFT_GOD_READY_FILE", str(ROOT / "logs" / "god-controller.ready")))
-    active_player_file = Path(os.getenv("MINECRAFT_ACTIVE_PLAYER_FILE", str(ROOT / "state" / "active_player.txt")))
     transcript = Transcript(ROOT)
-    codex = CodexAppServer(ROOT, transcript)
+    max_gods = max(1, int(os.getenv("MINECRAFT_MAX_GODS", "32")))
+    sessions: dict[str, GodSession] = {}
     try:
-        codex.request("initialize", {"clientInfo": {"name": "minecraft_god_controller", "title": "Minecraft God Controller", "version": "0.1.0"}})
-        codex.notify("initialized")
-        thread = codex.request("thread/start", {
-            "cwd": str(ROOT),
-            "model": os.getenv("MINECRAFT_GOD_MODEL", "gpt-5.6-luna"),
-            "approvalPolicy": "never",
-            "sandbox": "danger-full-access",
-        })
-        thread_id = thread["thread"]["id"]
-        try:
-            codex.request("thread/name/set", {"threadId": thread_id, "name": os.getenv("MINECRAFT_GOD_THREAD_NAME", "Minecraft God - Live Session")})
-        except Exception as exc:
-            print(f"[god] could not name Codex thread: {exc}", file=sys.stderr)
-        print(f"[god] Codex thread ready: {thread_id}", file=sys.stderr)
-
         cursor = wait_for_event_hub(event_url)
-        print(f"[god] Waiting for any player to join; ignoring {cursor} old events", file=sys.stderr)
+        print(f"[god] Waiting for players to join; ignoring {cursor} old events", file=sys.stderr)
         ready_file.parent.mkdir(parents=True, exist_ok=True)
         ready_file.write_text("ready\n", encoding="utf-8")
-        active_player_file.unlink(missing_ok=True)
-        first_join_seen = False
-        active_turn = False
-        pending_events: deque[dict[str, Any]] = deque(maxlen=32)
-        last_turn_at = time.monotonic()
-
-        while codex.process.poll() is None:
-            while True:
-                try:
-                    notification = codex.notifications.get_nowait()
-                except queue.Empty:
-                    break
-                if notification.get("method") == "turn/completed":
-                    active_turn = False
-
+        while True:
             try:
                 payload = fetch_events(event_url, cursor)
             except Exception as exc:
@@ -293,36 +370,37 @@ def main() -> None:
             for event in payload.get("events", []):
                 cursor = max(cursor, int(event.get("event_id", cursor)))
                 event_type = event.get("type")
-                if event_type == "player_join" and not first_join_seen:
-                    first_join_seen = True
-                    pending_events.append(event)
-                    player_name = event.get("player", "")
-                    if isinstance(player_name, str) and player_name:
-                        active_player_file.parent.mkdir(parents=True, exist_ok=True)
-                        active_player_file.write_text(player_name, encoding="utf-8")
-                    transcript.write("controller_event", event)
-                    print(f"[god] {event.get('player', 'A player')} joined; issuing the first god turn", file=sys.stderr)
-                elif first_join_seen and event_type in {"chat", "player_death", "dimension_change", "advancement", "explosion_near_player"}:
-                    pending_events.append(event)
-                    transcript.write("controller_event", event)
+                if event_type == "player_join":
+                    player_name = str(event.get("player", "")).strip()
+                    if not player_name:
+                        continue
+                    player_id = str(event.get("player_uuid", "") or "").strip().lower() or _stable_player_id(player_name)
+                    event = dict(event)
+                    event.setdefault("player_uuid", player_id)
+                    session = sessions.get(player_id)
+                    if session is None:
+                        if len(sessions) >= max_gods:
+                            print(f"[god] max god count {max_gods} reached; ignoring {player_name}", file=sys.stderr)
+                            continue
+                        session = GodSession(player_id, player_name, ROOT, transcript, idle_seconds)
+                        sessions[player_id] = session
+                        transcript.write("controller_event", {"routed_to": [player_id], "event": event})
+                        print(f"[god] {player_name} joined; creating its personal god", file=sys.stderr)
+                    session.player_name = player_name
+                    session.enqueue(event, first_join=True)
+                    continue
 
-            idle = first_join_seen and (time.monotonic() - last_turn_at) >= idle_seconds and not pending_events
-            if first_join_seen and not active_turn and (pending_events or idle):
-                event = _event_for_turn(pending_events) if pending_events else None
-                active_turn = True
-                last_turn_at = time.monotonic()
-                try:
-                    prompt = GOD_PROMPT + "\n\n" if event is not None and event.get("type") == "player_join" else ""
-                    transcript.write("turn_start", {"event": event, "idle": idle})
-                    codex.request("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": prompt + turn_text(event, first_join=event is not None and event.get("type") == "player_join", idle=idle)}]})
-                except Exception as exc:
-                    active_turn = False
-                    print(f"[god] turn failed: {exc}", file=sys.stderr)
+                recipients = [session for session in sessions.values() if _event_targets(event, session.player_id, session.player_name)]
+                if recipients:
+                    for session in recipients:
+                        session.enqueue(event)
+                    transcript.write("controller_event", {"routed_to": [session.player_id for session in recipients], "event": event})
             time.sleep(0.5)
     finally:
         ready_file = Path(os.getenv("MINECRAFT_GOD_READY_FILE", str(ROOT / "logs" / "god-controller.ready")))
         ready_file.unlink(missing_ok=True)
-        codex.close()
+        for session in sessions.values():
+            session.close()
 
 
 if __name__ == "__main__":

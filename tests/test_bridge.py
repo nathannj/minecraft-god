@@ -1,7 +1,10 @@
 import json
 import base64
+import uuid
 from pathlib import Path
 from urllib.request import Request, urlopen
+
+import pytest
 
 from god_bridge.bridge import BridgeConfig, GodBridge
 from god_bridge.mcp_server import call_tool, config_from_env, handle_request, start_event_server
@@ -193,3 +196,94 @@ def test_event_http_round_trip(tmp_path):
         assert payload["events"][0]["type"] == "player_join"
     finally:
         server.shutdown()
+
+
+def scoped_bridge(tmp_path: Path, player_id: str, player_name: str):
+    rcon = FakeRcon()
+    bridge = GodBridge(
+        BridgeConfig(
+            state_file=str(tmp_path / "legacy-state.json"),
+            profile_dir=str(tmp_path / "players"),
+            events_file=str(tmp_path / "events.jsonl"),
+            ledger_file=str(tmp_path / "ledger.sqlite3"),
+            god_player_id=player_id,
+            god_player_name=player_name,
+            dry_run=False,
+        ),
+        rcon=rcon,
+    )
+    bridge.register_player(player_id, player_name)
+    return bridge, rcon
+
+
+def test_player_god_state_isolated_by_uuid(tmp_path):
+    alice_id = str(uuid.uuid4())
+    bob_id = str(uuid.uuid4())
+    alice, _ = scoped_bridge(tmp_path, alice_id, "Alice")
+    bob, _ = scoped_bridge(tmp_path, bob_id, "Bob")
+
+    alice.update_god_state({"current_interest": "the old forest"})
+    assert alice.get_god_state()["current_interest"] == "the old forest"
+    assert bob.get_god_state()["current_interest"] == ""
+
+
+def test_player_god_cannot_target_another_player(tmp_path):
+    alice_id = str(uuid.uuid4())
+    bob_id = str(uuid.uuid4())
+    alice, _ = scoped_bridge(tmp_path, alice_id, "Alice")
+    alice.register_player(bob_id, "Bob")
+
+    with pytest.raises(PermissionError):
+        call_tool(alice, "effect", {"effect": "glowing", "player": "Bob"})
+    with pytest.raises(PermissionError):
+        call_tool(alice, "minecraft_command", {"command": "kill Bob"})
+    with pytest.raises(PermissionError):
+        call_tool(alice, "minecraft_command", {"command": "say @a you are all seen"})
+
+    whisper = call_tool(alice, "whisper_player", {"message": "I see you."})
+    assert whisper["private"] is True
+    assert whisper["command"].startswith("tellraw Alice ")
+
+
+def test_intervention_requires_target_god_approval_and_is_one_use(tmp_path):
+    alice_id = str(uuid.uuid4())
+    bob_id = str(uuid.uuid4())
+    alice, alice_rcon = scoped_bridge(tmp_path, alice_id, "Alice")
+    bob, _ = scoped_bridge(tmp_path, bob_id, "Bob")
+
+    request = alice.request_intervention("Bob", "Alice killed Bob in cold blood", event_id=44)
+    request_id = request["request"]["id"]
+    assert request["request"]["status"] == "pending"
+    with pytest.raises(PermissionError):
+        alice.use_intervention(request_id)
+
+    approved = bob.respond_intervention(request_id, "approve", "One strike. No more.")
+    assert approved["request"]["status"] == "approved"
+    result = alice.use_intervention(request_id)
+    assert result["action"] == "approved_smite"
+    assert any("execute at Bob run summon minecraft:lightning_bolt" in command for command in alice_rcon.commands)
+    with pytest.raises(PermissionError):
+        alice.use_intervention(request_id)
+
+
+def test_intervention_decline_is_final(tmp_path):
+    alice_id = str(uuid.uuid4())
+    bob_id = str(uuid.uuid4())
+    alice, _ = scoped_bridge(tmp_path, alice_id, "Alice")
+    bob, _ = scoped_bridge(tmp_path, bob_id, "Bob")
+    request = alice.request_intervention("Bob", "A grievance", duration=60)
+    request_id = request["request"]["id"]
+    declined = bob.respond_intervention(request_id, "decline", "Not under my sky.")
+    assert declined["request"]["status"] == "declined"
+    with pytest.raises(PermissionError):
+        alice.use_intervention(request_id)
+
+
+def test_shared_event_ids_are_unique_across_bridge_processes(tmp_path):
+    alice_id = str(uuid.uuid4())
+    bob_id = str(uuid.uuid4())
+    alice, _ = scoped_bridge(tmp_path, alice_id, "Alice")
+    bob, _ = scoped_bridge(tmp_path, bob_id, "Bob")
+    first = alice.record_event({"type": "player_prayer", "player_uuid": alice_id, "player": "Alice", "message": "one"})
+    second = bob.record_event({"type": "player_prayer", "player_uuid": bob_id, "player": "Bob", "message": "two"})
+    assert second["event_id"] > first["event_id"]

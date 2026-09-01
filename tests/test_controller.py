@@ -2,7 +2,7 @@ import json
 
 from collections import deque
 
-from god_bridge.controller import CodexAppServer, Transcript, _event_for_turn, turn_text
+from god_bridge.controller import CodexAppServer, Transcript, _event_for_turn, _event_targets, turn_text
 
 
 def test_transcript_writes_readable_and_jsonl_logs(tmp_path):
@@ -50,3 +50,22 @@ def test_turn_text_warns_about_stale_positions_without_periodic_snapshots():
     assert "re-observe immediately" in text
     assert "player can move while you reason" in text
     assert "status update merely" in text
+
+
+def test_death_event_routes_to_victim_and_killer_gods_only():
+    death = {
+        "type": "player_death",
+        "victim_uuid": "victim-id",
+        "victim": "Victim",
+        "killer_uuid": "killer-id",
+        "killer": "Killer",
+    }
+    assert _event_targets(death, "victim-id", "Victim")
+    assert _event_targets(death, "killer-id", "Killer")
+    assert not _event_targets(death, "bystander-id", "Bystander")
+
+
+def test_turn_text_contains_player_ownership_context():
+    text = turn_text(None, player_name="Alice", player_id="alice-id")
+    assert "personal god of Alice" in text
+    assert "directly affect only that player" in text

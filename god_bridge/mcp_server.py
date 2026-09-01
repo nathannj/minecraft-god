@@ -37,8 +37,14 @@ def tool_definitions() -> list[dict[str, Any]]:
         {"name": "get_god_state", "description": "Read persistent hidden narrative state for the god character.", "inputSchema": {"type": "object", "properties": {}}},
         {"name": "update_god_state", "description": "Persist narrative state fields such as disposition, current_interest, current_plan, chaos_budget, last_major_intervention, and memories.", "inputSchema": {"type": "object", "properties": {"updates": {"type": "object"}}, "required": ["updates"]}},
         {"name": "minecraft_command", "description": "Execute an arbitrary Minecraft server command through local RCON. Do not include the leading slash. RCON is the server console; set relative_to_player=true when using ~ coordinates near the player.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string", "minLength": 1}, "relative_to_player": {"type": "boolean", "default": False}}, "required": ["command"]}},
-        {"name": "god_say", "description": "Speak to all players in a dark-purple bold in-world god message.", "inputSchema": {"type": "object", "properties": {"message": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["message"]}},
-        {"name": "punish_player", "description": "Deliver a confirmed, theatrical consequence to the active player. Use after sustained blasphemy or a deliberate narrative judgment; do not answer repeated abuse with words alone. Modes: smite (lightning now) or storm (thunder weather).", "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["smite", "storm"], "default": "smite"}}}},
+        {"name": "god_say", "description": "Speak publicly to all players in a dark-purple bold in-world god message.", "inputSchema": {"type": "object", "properties": {"message": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["message"]}},
+        {"name": "whisper_player", "description": "Whisper privately to your own player. This is the normal way to speak directly to your subject.", "inputSchema": {"type": "object", "properties": {"message": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["message"]}},
+        {"name": "send_god_message", "description": "Send a private diplomatic message to another player's god. This communicates intent or information; it does not grant power or affect the other player.", "inputSchema": {"type": "object", "properties": {"target_player": {"type": "string", "description": "Other player's UUID or current name"}, "message": {"type": "string", "minLength": 1, "maxLength": 1000}, "subject": {"type": "string", "maxLength": 256}, "event_id": {"type": "integer"}}, "required": ["target_player", "message"]}},
+        {"name": "list_interventions", "description": "List incoming and outgoing god-to-god messages and intervention requests, including their approval status.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}}}},
+        {"name": "request_intervention", "description": "Ask another player's god for one permissioned smite against that player's subject. The target god must explicitly approve it before use.", "inputSchema": {"type": "object", "properties": {"target_player": {"type": "string", "description": "The player whose god must approve the request"}, "reason": {"type": "string", "minLength": 1, "maxLength": 1000}, "event_id": {"type": "integer"}, "duration": {"type": "integer", "minimum": 60, "maximum": 3600, "default": 900}}, "required": ["target_player", "reason"]}},
+        {"name": "respond_intervention", "description": "Approve or decline an incoming intervention request. Approval creates a single-use, expiring permission scoped to the requested target and action.", "inputSchema": {"type": "object", "properties": {"request_id": {"type": "string"}, "decision": {"type": "string", "enum": ["approve", "decline"]}, "note": {"type": "string", "maxLength": 1000}}, "required": ["request_id", "decision"]}},
+        {"name": "use_intervention", "description": "Consume an approved one-use intervention permission and deliver the authorized smite. Only the requesting god can use it.", "inputSchema": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
+        {"name": "punish_player", "description": "Deliver a confirmed, theatrical consequence to your own player. Use after sustained blasphemy or a deliberate narrative judgment; do not answer repeated abuse with words alone. Modes: smite (lightning now) or storm (thunder weather).", "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["smite", "storm"], "default": "smite"}}}},
         {"name": "spawn_entity", "description": "Summon an entity at a Minecraft coordinate string; use '~ ~ ~' to summon near the configured player only when that is intended.", "inputSchema": {"type": "object", "properties": {"entity_type": {"type": "string"}, "position": {"type": "string", "default": "~ ~ ~"}, "nbt": {"type": "string", "default": ""}}, "required": ["entity_type"]}},
         {"name": "place_entity_on_block", "description": "Safely summon a named entity centered one block above an exact support block. The support must match and the target block plus head block must be air; the tool refuses to place an entity inside leaves, trees, walls, or water. The returned tag lets you address it reliably later.", "inputSchema": {"type": "object", "properties": {"entity_type": {"type": "string"}, "block_position": {"type": "string"}, "support_block": {"type": "string"}, "name": {"type": "string"}, "color": {"type": "string", "default": "gold"}, "tag": {"type": "string"}, "nbt": {"type": "string", "default": ""}, "no_ai": {"type": "boolean", "default": True}}, "required": ["entity_type", "block_position", "support_block", "name"]}},
         {"name": "move_entity_to_block", "description": "Move one tagged entity to the center one block above an exact support block, only when that block matches. Use the tag returned by place_entity_on_block.", "inputSchema": {"type": "object", "properties": {"tag": {"type": "string"}, "block_position": {"type": "string"}, "support_block": {"type": "string"}}, "required": ["tag", "block_position", "support_block"]}},
@@ -89,6 +95,18 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         return bridge.execute(command)
     if name == "god_say":
         return bridge.god_say(args["message"])
+    if name == "whisper_player":
+        return bridge.god_whisper(args["message"])
+    if name == "send_god_message":
+        return bridge.send_god_message(args["target_player"], args["message"], subject=args.get("subject", ""), event_id=args.get("event_id"))
+    if name == "list_interventions":
+        return {"ok": True, "interventions": bridge.list_interventions(args.get("limit", 20))}
+    if name == "request_intervention":
+        return bridge.request_intervention(args["target_player"], args["reason"], event_id=args.get("event_id"), duration=args.get("duration", 900))
+    if name == "respond_intervention":
+        return bridge.respond_intervention(args["request_id"], args["decision"], args.get("note", ""))
+    if name == "use_intervention":
+        return bridge.use_intervention(args["request_id"])
     if name == "punish_player":
         return bridge.punish_player(args.get("mode", "smite"))
     if name == "spawn_entity":
@@ -175,7 +193,11 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         return result
     if name == "give_item":
         item = parse_identifier(args["item"], "item")
-        player = parse_identifier(args.get("player", bridge.current_player_name()), "player")
+        player = bridge.current_player_name()
+        if bridge.owner_id:
+            bridge.owned_player(args.get("player", player))
+        else:
+            player = parse_identifier(args.get("player", player), "player")
         amount = max(1, min(int(args.get("amount", 1)), 2304))
         return bridge.action("give_item", lambda: f"give {player} {item} {amount}")
     if name == "set_weather":
@@ -190,7 +212,11 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
             raise ValueError("time must be a Minecraft time token")
         return bridge.action("set_time", lambda: f"time set {time}")
     if name == "teleport":
-        target = parse_identifier(args.get("target", bridge.current_player_name()), "target")
+        target = bridge.current_player_name()
+        if bridge.owner_id:
+            bridge.owned_player(args.get("target", target))
+        else:
+            target = parse_identifier(args.get("target", target), "target")
         position = parse_position(args["position"])
         dimension = args.get("dimension", "")
         if dimension:
@@ -203,7 +229,11 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         return bridge.action("teleport", lambda: command)
     if name == "effect":
         effect = parse_identifier(args["effect"], "effect")
-        player = parse_identifier(args.get("player", bridge.current_player_name()), "player")
+        player = bridge.current_player_name()
+        if bridge.owner_id:
+            bridge.owned_player(args.get("player", player))
+        else:
+            player = parse_identifier(args.get("player", player), "player")
         duration = max(1, min(int(args.get("duration", 30)), 100000))
         amplifier = max(0, min(int(args.get("amplifier", 0)), 255))
         return bridge.action("effect", lambda: f"effect give {player} {effect} {duration} {amplifier}")
@@ -357,7 +387,7 @@ def config_from_env(config_file: str | None = None) -> BridgeConfig:
         values = json.loads(Path(config_file).read_text(encoding="utf-8"))
         if not isinstance(values, dict):
             raise ValueError("config file must contain a JSON object")
-        for field in ("rcon_host", "rcon_port", "rcon_password", "player_name", "active_player_file", "event_host", "event_port", "event_token", "state_file", "dry_run", "max_command_length", "camera_output_dir", "camera_plugin_render_dir", "camera_timeout", "structure_catalog_file", "structure_datapacks_dir", "structure_download_dir", "structure_max_download_mb", "minecraft_version"):
+        for field in ("rcon_host", "rcon_port", "rcon_password", "player_name", "god_player_id", "god_player_name", "profile_dir", "active_player_file", "event_host", "event_port", "event_token", "state_file", "events_file", "ledger_file", "max_gods", "dry_run", "max_command_length", "camera_output_dir", "camera_plugin_render_dir", "camera_timeout", "structure_catalog_file", "structure_datapacks_dir", "structure_download_dir", "structure_max_download_mb", "minecraft_version"):
             if field in values:
                 setattr(config, field, values[field])
 
@@ -366,11 +396,17 @@ def config_from_env(config_file: str | None = None) -> BridgeConfig:
         "MINECRAFT_RCON_PORT": ("rcon_port", int),
         "MINECRAFT_RCON_PASSWORD": ("rcon_password", str),
         "MINECRAFT_PLAYER": ("player_name", str),
+        "MINECRAFT_GOD_PLAYER": ("god_player_name", str),
+        "MINECRAFT_GOD_PLAYER_ID": ("god_player_id", str),
+        "MINECRAFT_PROFILE_DIR": ("profile_dir", str),
         "MINECRAFT_ACTIVE_PLAYER_FILE": ("active_player_file", str),
         "MINECRAFT_EVENT_HOST": ("event_host", str),
         "MINECRAFT_EVENT_PORT": ("event_port", int),
         "MINECRAFT_EVENT_TOKEN": ("event_token", str),
         "MINECRAFT_STATE_FILE": ("state_file", str),
+        "MINECRAFT_EVENTS_FILE": ("events_file", str),
+        "MINECRAFT_LEDGER_FILE": ("ledger_file", str),
+        "MINECRAFT_MAX_GODS": ("max_gods", int),
         "MINECRAFT_MAX_COMMAND_LENGTH": ("max_command_length", int),
         "MINECRAFT_CAMERA_OUTPUT_DIR": ("camera_output_dir", str),
         "MINECRAFT_CAMERA_PLUGIN_RENDER_DIR": ("camera_plugin_render_dir", str),

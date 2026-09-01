@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .rcon import RconClient
+from .ledger import GodLedger, expiry_after
 from .structures import StructureLibrary
 
 
@@ -51,11 +52,17 @@ class BridgeConfig:
     rcon_port: int = 25575
     rcon_password: str = ""
     player_name: str = "IAmBoreder"
+    god_player_id: str = ""
+    god_player_name: str = ""
+    profile_dir: str = "state/players"
     active_player_file: str = "state/active_player.txt"
     event_host: str = "127.0.0.1"
     event_port: int = 8765
     event_token: str = ""
     state_file: str = "state/god_state.json"
+    events_file: str | None = None
+    ledger_file: str | None = None
+    max_gods: int = 32
     dry_run: bool = False
     max_command_length: int = 512
     camera_output_dir: str = "state/captures"
@@ -183,17 +190,73 @@ class GodBridge:
         self._lock = threading.RLock()
         self._events: deque[dict[str, Any]] = deque(maxlen=100)
         self._chat: deque[dict[str, Any]] = deque(maxlen=50)
-        self._state_path = Path(config.state_file)
-        self._events_path = self._state_path.with_name("events.jsonl")
+        configured_state = Path(config.state_file)
+        self._owner_id = self._normalize_owner_id(config.god_player_id)
+        self._profile_dir = self._absolute_path(config.profile_dir)
+        if self._owner_id:
+            self._state_path = self._profile_dir / self._profile_key(self._owner_id) / "god_state.json"
+        else:
+            self._state_path = configured_state
+        self._events_path = self._absolute_path(config.events_file) if config.events_file else self._state_path.with_name("events.jsonl")
+        ledger_path = self._absolute_path(config.ledger_file) if config.ledger_file else configured_state.with_name("god_ledger.sqlite3")
+        self._ledger = GodLedger(ledger_path)
         self._next_event_id = 1
         self._god_state = self._load_state()
         self._refresh_events()
 
+    @staticmethod
+    def _normalize_owner_id(value: str) -> str:
+        value = str(value or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f-]{27,}", value) or re.fullmatch(r"[0-9a-f]{32}", value):
+            return value
+        return ""
+
+    @staticmethod
+    def _profile_key(player_id: str) -> str:
+        return re.sub(r"[^a-z0-9-]", "", player_id.casefold())[:64]
+
+    def _absolute_path(self, value: str | Path | None) -> Path:
+        if value is None:
+            return Path("")
+        path = Path(value)
+        return path if path.is_absolute() else Path(__file__).resolve().parents[1] / path
+
+    @property
+    def owner_id(self) -> str:
+        return self._owner_id
+
+    def _require_owner(self) -> str:
+        if not self._owner_id:
+            raise PermissionError("this bridge is not scoped to a player god")
+        return self._owner_id
+
+    def _owner_profile(self) -> dict[str, Any]:
+        profile = self._ledger.player(self._owner_id) if self._owner_id else None
+        name = str((profile or {}).get("name") or self.config.god_player_name or self.config.player_name)
+        return {"player_id": self._owner_id, "name": name, "online": bool((profile or {}).get("online", False))}
+
+    def _resolve_player(self, reference: str) -> dict[str, Any]:
+        profile = self._ledger.player(reference)
+        if not profile:
+            raise ValueError(f"unknown player profile: {reference}")
+        return profile
+
+    def owned_player(self, reference: str = "") -> dict[str, Any]:
+        owner_id = self._require_owner()
+        profile = self._resolve_player(reference or owner_id)
+        if profile["player_id"] != owner_id:
+            raise PermissionError("a god may only target its own player")
+        return profile
+
     def _load_state(self) -> dict[str, Any]:
-        if not self._state_path.exists():
+        return self._load_state_from(self._state_path)
+
+    @staticmethod
+    def _load_state_from(path: Path) -> dict[str, Any]:
+        if not path.exists():
             return json.loads(json.dumps(DEFAULT_GOD_STATE))
         try:
-            loaded = json.loads(self._state_path.read_text(encoding="utf-8"))
+            loaded = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return json.loads(json.dumps(DEFAULT_GOD_STATE))
         state = json.loads(json.dumps(DEFAULT_GOD_STATE))
@@ -201,43 +264,98 @@ class GodBridge:
             state.update(loaded)
         return state
 
+    def _state_path_for(self, player_id: str) -> Path:
+        if self._owner_id and player_id == self._owner_id:
+            return self._state_path
+        return self._profile_dir / self._profile_key(player_id) / "god_state.json"
+
+    def _load_state_for(self, player_id: str) -> dict[str, Any]:
+        return self._load_state_from(self._state_path_for(player_id))
+
     def _save_state(self) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        self._state_path.write_text(json.dumps(self._god_state, indent=2) + "\n", encoding="utf-8")
+        self._save_state_to(self._state_path, self._god_state)
+
+    @staticmethod
+    def _save_state_to(path: Path, state: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+
+    def _event_player_id(self, event: dict[str, Any], key: str = "player_uuid") -> str:
+        value = str(event.get(key, "") or "").strip().lower()
+        if value:
+            return value
+        name_key = {"player_uuid": "player", "victim_uuid": "victim", "killer_uuid": "killer"}.get(key, "player")
+        name = str(event.get(name_key, "") or "")
+        profile = self._ledger.player(name)
+        return str(profile.get("player_id", "")) if profile else ""
+
+    def event_matches_owner(self, event: dict[str, Any]) -> bool:
+        """Return whether an event belongs in this god's private context."""
+        if not self._owner_id:
+            return True
+        fields = ("player_uuid", "victim_uuid", "killer_uuid", "target_player_id", "from_player_id", "to_player_id")
+        if any(str(event.get(field, "")).lower() == self._owner_id for field in fields):
+            return True
+        owner_name = self.current_player_name().casefold()
+        return any(str(event.get(field, "")).casefold() == owner_name for field in ("player", "victim", "killer", "target"))
 
     def record_event(self, event: dict[str, Any]) -> dict[str, Any]:
         clean = dict(event)
         clean.setdefault("type", "unknown")
         clean.setdefault("at", utc_now())
+        for id_key, name_key in (("player_uuid", "player"), ("victim_uuid", "victim"), ("killer_uuid", "killer")):
+            player_id = str(clean.get(id_key, "") or "").strip().lower()
+            player_name = str(clean.get(name_key, "") or "").strip()
+            if player_id and player_name:
+                try:
+                    self._ledger.register_player(player_id, player_name, online=clean["type"] != "player_quit")
+                except ValueError:
+                    pass
         automatic_consequence = False
         consequence_level = 0
+        consequence_player_id = ""
+        consequence_state = self._god_state
+        consequence_path = self._state_path
         if clean.get("type") in {"chat", "player_chat"} and isinstance(clean.get("message"), str):
             player = str(clean.get("player", ""))
-            if player and player.casefold() == self.current_player_name().casefold():
+            player_id = self._event_player_id(clean)
+            is_owner_event = bool(player_id and player_id == self._owner_id) or (not self._owner_id and player.casefold() == self.current_player_name().casefold())
+            if player and (not self._owner_id or is_owner_event):
                 conduct = assess_conduct(clean["message"])
                 clean["conduct"] = conduct
                 now = time.time()
                 with self._lock:
-                    window_started = _parse_epoch(self._god_state.get("conduct_window_started_at"))
+                    consequence_player_id = player_id or self._owner_id
+                    if consequence_player_id and consequence_player_id != self._owner_id:
+                        consequence_state = self._load_state_for(consequence_player_id)
+                        consequence_path = self._state_path_for(consequence_player_id)
+                    window_started = _parse_epoch(consequence_state.get("conduct_window_started_at"))
                     if window_started is None or now - window_started > 180:
-                        self._god_state["conduct_score"] = 0
+                        consequence_state["conduct_score"] = 0
                         window_started = now
-                    score = int(self._god_state.get("conduct_score", 0)) + int(conduct["points"])
-                    self._god_state["conduct_score"] = score
-                    self._god_state["conduct_window_started_at"] = _epoch_string(window_started)
-                    last_consequence = _parse_epoch(self._god_state.get("last_consequence_at"))
+                    score = int(consequence_state.get("conduct_score", 0)) + int(conduct["points"])
+                    consequence_state["conduct_score"] = score
+                    consequence_state["conduct_window_started_at"] = _epoch_string(window_started)
+                    last_consequence = _parse_epoch(consequence_state.get("last_consequence_at"))
                     if score >= 3 and (last_consequence is None or now - last_consequence >= 45):
                         automatic_consequence = True
-                        consequence_level = int(self._god_state.get("consequence_count", 0)) + 1
-                        self._god_state["conduct_score"] = 0
-                        self._god_state["last_consequence_at"] = _epoch_string(now)
-                        self._god_state["consequence_count"] = consequence_level
-                    self._save_state()
+                        consequence_level = int(consequence_state.get("consequence_count", 0)) + 1
+                        consequence_state["conduct_score"] = 0
+                        consequence_state["last_consequence_at"] = _epoch_string(now)
+                        consequence_state["consequence_count"] = consequence_level
+                    self._save_state_to(consequence_path, consequence_state)
+                    if consequence_path == self._state_path:
+                        self._god_state = consequence_state
                 clean["conduct"]["automatic_consequence"] = automatic_consequence
                 if automatic_consequence:
                     clean["conduct"]["consequence_level"] = consequence_level
         with self._lock:
-            clean.setdefault("event_id", self._next_event_id)
+            supplied_event_id = clean.pop("event_id", None)
+            if supplied_event_id is not None:
+                clean["source_event_id"] = supplied_event_id
+            clean["event_id"] = self._ledger.next_event_id(self._next_event_id - 1)
             self._next_event_id = max(self._next_event_id, int(clean["event_id"]) + 1)
             self._events.append(clean)
             if clean["type"] in {"chat", "player_chat"} or "message" in clean:
@@ -246,18 +364,23 @@ class GodBridge:
             with self._events_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(clean, separators=(",", ":")) + "\n")
         if automatic_consequence and not self.config.dry_run:
-            self._apply_consequence(consequence_level)
+            self._apply_consequence(consequence_level, consequence_player_id)
         return clean
 
-    def _apply_consequence(self, level: int) -> dict[str, Any]:
+    def _apply_consequence(self, level: int, player_id: str = "") -> dict[str, Any]:
         """Apply an immediate consequence when sustained abuse crosses the threshold."""
-        player = self.current_player_name()
-        result = self.execute(f"execute at {player} run summon minecraft:lightning_bolt ~ ~ ~")
+        player = self.current_player_name() if not player_id or player_id == self._owner_id else str((self._ledger.player(player_id) or {}).get("name", ""))
+        if not player:
+            return {"ok": False, "error": "consequence target is not registered"}
+        result = self._execute_targeted(f"execute at {player} run summon minecraft:lightning_bolt ~ ~ ~", player_id or self._owner_id)
         result["action"] = "automatic_consequence"
         result["consequence_level"] = level
-        with self._lock:
-            self._god_state["last_major_intervention"] = f"Automatic consequence level {level}: lightning answered sustained blasphemy."
-            self._save_state()
+        state_path = self._state_path_for(player_id or self._owner_id)
+        state = self._god_state if not player_id or player_id == self._owner_id else self._load_state_for(player_id)
+        state["last_major_intervention"] = f"Automatic consequence level {level}: lightning answered sustained blasphemy."
+        self._save_state_to(state_path, state)
+        if state_path == self._state_path:
+            self._god_state = state
         return result
 
     def _refresh_events(self) -> None:
@@ -283,7 +406,24 @@ class GodBridge:
                 if event.get("type") in {"chat", "player_chat"} or "message" in event:
                     self._chat.append(event)
 
-    def execute(self, command: str, *, record: bool = True) -> dict[str, Any]:
+    def _assert_command_authorized(self, command: str, *, target_player_id: str = "", capability: bool = False, allow_shared: bool = False) -> None:
+        if not self._owner_id or capability or allow_shared:
+            return
+        if target_player_id and target_player_id != self._owner_id:
+            raise PermissionError("a god may only affect its own player unless it consumes an approved intervention")
+        lowered = command.casefold()
+        if re.search(r"@[apr]\b", lowered) or re.search(r"@e(?!\[tag=god_[a-z0-9_.-]+)", lowered):
+            raise PermissionError("player selectors that can affect another player are not available to a player god")
+        for profile in self._ledger.players():
+            name = str(profile.get("name", ""))
+            if profile.get("player_id") != self._owner_id and re.search(rf"(?<![A-Za-z0-9_]){re.escape(name.casefold())}(?![A-Za-z0-9_])", lowered):
+                raise PermissionError(f"command targets another player's god-owned subject: {name}")
+
+    def _execute_targeted(self, command: str, target_player_id: str, *, capability: bool = False) -> dict[str, Any]:
+        self._assert_command_authorized(command, target_player_id=target_player_id, capability=capability)
+        return self.execute(command, record=True, target_player_id=target_player_id, capability=capability)
+
+    def execute(self, command: str, *, record: bool = True, target_player_id: str = "", capability: bool = False, allow_shared: bool = False) -> dict[str, Any]:
         if not isinstance(command, str) or not command.strip():
             raise ValueError("command must be a non-empty string")
         if len(command) > self.config.max_command_length:
@@ -291,6 +431,7 @@ class GodBridge:
         if any(char in command for char in "\r\n\x00"):
             raise ValueError("command cannot contain newlines or NUL bytes")
         command = command.strip().lstrip("/")
+        self._assert_command_authorized(command, target_player_id=target_player_id, capability=capability, allow_shared=allow_shared)
         if self.config.dry_run:
             result = {"command": command, "ok": True, "dry_run": True, "output": ""}
         else:
@@ -305,7 +446,12 @@ class GodBridge:
             if not result["ok"]:
                 result["error"] = "Minecraft rejected the command or found no matching target."
         if record:
-            self.record_event({"type": "god_action", "command": command, "result": result.get("output", "")})
+            action_event: dict[str, Any] = {"type": "god_action", "command": command, "result": result.get("output", "")}
+            if self._owner_id:
+                action_event.update({"player_uuid": self._owner_id, "player": self.current_player_name()})
+            if target_player_id:
+                action_event["target_player_id"] = target_player_id
+            self.record_event(action_event)
         return result
 
     def command_at_player(self, command: str) -> str:
@@ -429,7 +575,21 @@ class GodBridge:
             raise RuntimeError(f"Could not parse player position: {result.get('output', '')}")
         return tuple(float(value) for value in values[-3:])  # type: ignore[return-value]
 
+    def current_player_id(self) -> str:
+        if self._owner_id:
+            return self._owner_id
+        active_name = ""
+        active_file = Path(self.config.active_player_file)
+        try:
+            active_name = active_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        profile = self._ledger.player(active_name or self.config.player_name)
+        return str(profile.get("player_id", "")) if profile else ""
+
     def current_player_name(self) -> str:
+        if self._owner_id:
+            return self._owner_profile()["name"]
         active_file = Path(self.config.active_player_file)
         try:
             active_name = active_file.read_text(encoding="utf-8").strip()
@@ -438,6 +598,12 @@ class GodBridge:
         if re.fullmatch(r"[A-Za-z0-9_]{1,16}", active_name):
             return active_name
         return self.config.player_name
+
+    def register_player(self, player_id: str, name: str, *, online: bool = True) -> dict[str, Any]:
+        return self._ledger.register_player(player_id, name, online=online)
+
+    def player_profiles(self) -> list[dict[str, Any]]:
+        return self._ledger.players()
 
     def observe_world(self) -> dict[str, Any]:
         player_name = self.current_player_name()
@@ -478,18 +644,18 @@ class GodBridge:
         limit = _bounded_limit(limit)
         self._refresh_events()
         with self._lock:
-            return list(self._chat)[-limit:]
+            return [event for event in self._chat if self.event_matches_owner(event)][-limit:]
 
     def recent_events(self, limit: int = 10) -> list[dict[str, Any]]:
         limit = _bounded_limit(limit)
         self._refresh_events()
         with self._lock:
-            return list(self._events)[-limit:]
+            return [event for event in self._events if self.event_matches_owner(event)][-limit:]
 
     def events_since(self, after_event_id: int = 0, limit: int = 100) -> list[dict[str, Any]]:
         self._refresh_events()
         with self._lock:
-            return [event for event in self._events if int(event.get("event_id", 0)) > after_event_id][:max(1, min(limit, 200))]
+            return [event for event in self._events if int(event.get("event_id", 0)) > after_event_id and self.event_matches_owner(event)][:max(1, min(limit, 200))]
 
     def latest_event_id(self) -> int:
         self._refresh_events()
@@ -498,6 +664,10 @@ class GodBridge:
 
     def get_god_state(self) -> dict[str, Any]:
         with self._lock:
+            # The event hub may update conduct in the same profile while the
+            # god process is thinking. Reload before exposing or modifying it
+            # so a narrative update cannot silently erase a fresh consequence.
+            self._god_state = self._load_state_from(self._state_path)
             return json.loads(json.dumps(self._god_state))
 
     def update_god_state(self, updates: dict[str, Any]) -> dict[str, Any]:
@@ -508,6 +678,7 @@ class GodBridge:
         if unknown:
             raise ValueError(f"unknown god state fields: {', '.join(sorted(unknown))}")
         with self._lock:
+            self._god_state = self._load_state_from(self._state_path)
             self._god_state.update(updates)
             self._save_state()
             return self.get_god_state()
@@ -518,8 +689,113 @@ class GodBridge:
         if len(message) > 256:
             raise ValueError("god message cannot exceed 256 characters")
         tellraw = f"tellraw @a {{\"text\":{json.dumps(message)},\"color\":\"dark_purple\",\"bold\":true}}"
-        result = self.execute(tellraw)
+        result = self.execute(tellraw, allow_shared=True)
         result["message"] = message
+        return result
+
+    def god_whisper(self, message: str) -> dict[str, Any]:
+        owner_id = self._require_owner()
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("message must be a non-empty string")
+        if len(message) > 256:
+            raise ValueError("god message cannot exceed 256 characters")
+        player = self.current_player_name()
+        tellraw = f"tellraw {player} {{\"text\":{json.dumps(message)},\"color\":\"dark_purple\",\"bold\":true}}"
+        result = self._execute_targeted(tellraw, owner_id)
+        result.update({"message": message, "player": player, "private": True})
+        return result
+
+    def send_god_message(self, target: str, message: str, *, subject: str = "", event_id: int | None = None) -> dict[str, Any]:
+        owner_id = self._require_owner()
+        target_profile = self._resolve_player(target)
+        if target_profile["player_id"] == owner_id:
+            raise ValueError("use whisper_player to speak to your own player")
+        if not isinstance(message, str) or not message.strip() or len(message) > 1000:
+            raise ValueError("message must be between 1 and 1000 characters")
+        interaction = self._ledger.add_interaction(
+            kind="god_message",
+            from_player_id=owner_id,
+            to_player_id=target_profile["player_id"],
+            status="delivered",
+            message=message.strip(),
+            reason=subject.strip()[:256],
+            event_id=event_id,
+        )
+        self.record_event({
+            "type": "god_message",
+            "from_player_id": owner_id,
+            "from_player": self.current_player_name(),
+            "to_player_id": target_profile["player_id"],
+            "to_player": target_profile["name"],
+            "message": message.strip(),
+            "subject": subject.strip()[:256],
+            "interaction_id": interaction["id"],
+            "source_event_id": event_id,
+        })
+        return {"ok": True, "interaction": interaction}
+
+    def list_interventions(self, limit: int = 20) -> list[dict[str, Any]]:
+        owner_id = self._require_owner()
+        return self._ledger.interactions_for(owner_id, limit=limit)
+
+    def request_intervention(self, target: str, reason: str, *, event_id: int | None = None, duration: int = 900) -> dict[str, Any]:
+        owner_id = self._require_owner()
+        target_profile = self._resolve_player(target)
+        if target_profile["player_id"] == owner_id:
+            raise ValueError("a god does not need permission to affect its own player")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
+            raise ValueError("reason must be between 1 and 1000 characters")
+        interaction = self._ledger.add_interaction(
+            kind="intervention_request",
+            from_player_id=owner_id,
+            to_player_id=target_profile["player_id"],
+            action="smite",
+            target_player_id=target_profile["player_id"],
+            reason=reason.strip(),
+            event_id=event_id,
+            expires_at=expiry_after(max(60, min(int(duration), 3600))),
+        )
+        self.record_event({
+            "type": "intervention_request",
+            "interaction_id": interaction["id"],
+            "from_player_id": owner_id,
+            "from_player": self.current_player_name(),
+            "to_player_id": target_profile["player_id"],
+            "to_player": target_profile["name"],
+            "target_player_id": target_profile["player_id"],
+            "action": "smite",
+            "reason": reason.strip(),
+        })
+        return {"ok": True, "request": interaction}
+
+    def respond_intervention(self, request_id: str, decision: str, note: str = "") -> dict[str, Any]:
+        owner_id = self._require_owner()
+        result = self._ledger.respond(request_id, owner_id, decision, str(note)[:1000])
+        self.record_event({
+            "type": "intervention_response",
+            "interaction_id": request_id,
+            "from_player_id": owner_id,
+            "to_player_id": result["from_player_id"],
+            "status": result["status"],
+            "message": result.get("message", ""),
+        })
+        return {"ok": True, "request": result}
+
+    def use_intervention(self, request_id: str) -> dict[str, Any]:
+        owner_id = self._require_owner()
+        interaction = self._ledger.consume(request_id, owner_id)
+        target = self._resolve_player(interaction["target_player_id"])
+        command = f"execute at {target['name']} run summon minecraft:lightning_bolt ~ ~ ~"
+        result = self._execute_targeted(command, target["player_id"], capability=True)
+        result.update({"action": "approved_smite", "request_id": request_id, "target": target["name"]})
+        self.record_event({
+            "type": "intervention_used",
+            "interaction_id": request_id,
+            "player_uuid": owner_id,
+            "target_player_id": target["player_id"],
+            "target": target["name"],
+            "result": result.get("output", ""),
+        })
         return result
 
     def punish_player(self, mode: str = "smite") -> dict[str, Any]:
@@ -534,6 +810,7 @@ class GodBridge:
         result = self.action("punish_player", lambda: command)
         if result.get("ok"):
             with self._lock:
+                self._god_state = self._load_state_from(self._state_path)
                 self._god_state["last_major_intervention"] = f"Delivered deliberate {mode} consequence to {player}."
                 self._save_state()
         return result

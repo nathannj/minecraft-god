@@ -68,29 +68,44 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         String message = PlainTextComponentSerializer.plainText().serialize(event.message());
         sendEvent(event("chat", Map.of(
                 "player", player.getName(),
+                "player_uuid", player.getUniqueId().toString(),
                 "message", message
         )));
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onJoin(PlayerJoinEvent event) {
-        sendEvent(event("player_join", Map.of("player", event.getPlayer().getName())));
+        sendEvent(event("player_join", Map.of(
+                "player", event.getPlayer().getName(),
+                "player_uuid", event.getPlayer().getUniqueId().toString()
+        )));
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onQuit(PlayerQuitEvent event) {
         if (isTracked(event.getPlayer())) {
-            sendEvent(event("player_quit", Map.of("player", event.getPlayer().getName())));
+            sendEvent(event("player_quit", Map.of(
+                    "player", event.getPlayer().getName(),
+                    "player_uuid", event.getPlayer().getUniqueId().toString()
+            )));
         }
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onDeath(PlayerDeathEvent event) {
         if (isTracked(event.getEntity())) {
-            sendEvent(event("player_death", Map.of(
-                    "player", event.getEntity().getName(),
-                    "message", event.getDeathMessage() == null ? "" : event.getDeathMessage()
-            )));
+            Map<String, Object> death = new LinkedHashMap<>();
+            death.put("player", event.getEntity().getName());
+            death.put("player_uuid", event.getEntity().getUniqueId().toString());
+            death.put("victim", event.getEntity().getName());
+            death.put("victim_uuid", event.getEntity().getUniqueId().toString());
+            death.put("message", event.getDeathMessage() == null ? "" : event.getDeathMessage());
+            Player killer = event.getEntity().getKiller();
+            if (killer != null) {
+                death.put("killer", killer.getName());
+                death.put("killer_uuid", killer.getUniqueId().toString());
+            }
+            sendEvent(event("player_death", death));
         }
     }
 
@@ -99,6 +114,7 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         if (isTracked(event.getPlayer())) {
             sendEvent(event("dimension_change", Map.of(
                     "player", event.getPlayer().getName(),
+                    "player_uuid", event.getPlayer().getUniqueId().toString(),
                     "from", event.getFrom().getKey().toString(),
                     "to", event.getPlayer().getWorld().getKey().toString()
             )));
@@ -110,6 +126,7 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         if (isTracked(event.getPlayer())) {
             sendEvent(event("advancement", Map.of(
                     "player", event.getPlayer().getName(),
+                    "player_uuid", event.getPlayer().getUniqueId().toString(),
                     "advancement", event.getAdvancement().getKey().toString()
             )));
         }
@@ -122,6 +139,7 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         if (tracked != null) {
             sendEvent(event("explosion_near_player", Map.of(
                     "player", tracked.getName(),
+                    "player_uuid", tracked.getUniqueId().toString(),
                     "entity", event.getEntityType().getKey().toString(),
                     "position", position(location)
             )));
@@ -134,6 +152,18 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
      */
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (command.getName().equalsIgnoreCase("pray")) {
+            return prayer(sender, args, "pray");
+        }
+        if (command.getName().equalsIgnoreCase("whisper")) {
+            if (args.length == 0 || !args[0].equalsIgnoreCase("god")) {
+                sender.sendMessage("Usage: /whisper god <message>");
+                return true;
+            }
+            String[] prayerArgs = new String[Math.max(0, args.length - 1)];
+            System.arraycopy(args, 1, prayerArgs, 0, prayerArgs.length);
+            return prayer(sender, prayerArgs, "whisper god");
+        }
         if (command.getName().equalsIgnoreCase("godcheck")) {
             return godcheck(sender, args);
         }
@@ -153,6 +183,31 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         int radius = boundedArg(args, 1, 8, 1, 12);
         int vertical = boundedArg(args, 2, 5, 1, 8);
         sender.sendMessage(toJson(sceneScan(player, radius, vertical)));
+        return true;
+    }
+
+    private boolean prayer(CommandSender sender, String[] args, String commandName) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("Only a player can speak privately to their god.");
+            return true;
+        }
+        String message = String.join(" ", args).trim();
+        if (message.isBlank()) {
+            sender.sendMessage("Usage: /" + commandName + " <message>");
+            return true;
+        }
+        if (message.length() > 1000) {
+            sender.sendMessage("Your prayer is too long (maximum 1000 characters).");
+            return true;
+        }
+        sendEvent(event("player_prayer", Map.of(
+                "player", player.getName(),
+                "player_uuid", player.getUniqueId().toString(),
+                "message", message,
+                "private", true,
+                "command", commandName
+        )));
+        sender.sendMessage("Your words reach the god who watches you.");
         return true;
     }
 
@@ -265,30 +320,25 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
     }
 
     private boolean isTracked(Player player) {
-        return playerName.isBlank() || player.getName().equalsIgnoreCase(playerName);
+        // Multi-god mode observes every player. The controller performs the
+        // per-UUID routing; filtering here would silently starve other gods.
+        return true;
     }
 
     private Player nearestTrackedPlayer(Location location, double radius) {
-        if (playerName.isBlank()) {
-            Player nearest = null;
-            double nearestDistance = radius * radius;
-            for (Player player : Bukkit.getOnlinePlayers()) {
-                if (!player.getWorld().equals(location.getWorld())) {
-                    continue;
-                }
-                double distance = player.getLocation().distanceSquared(location);
-                if (distance <= nearestDistance) {
-                    nearest = player;
-                    nearestDistance = distance;
-                }
+        Player nearest = null;
+        double nearestDistance = radius * radius;
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (!player.getWorld().equals(location.getWorld())) {
+                continue;
             }
-            return nearest;
+            double distance = player.getLocation().distanceSquared(location);
+            if (distance <= nearestDistance) {
+                nearest = player;
+                nearestDistance = distance;
+            }
         }
-        Player player = Bukkit.getPlayerExact(playerName);
-        if (player == null || !player.getWorld().equals(location.getWorld())) {
-            return null;
-        }
-        return player.getLocation().distanceSquared(location) <= radius * radius ? player : null;
+        return nearest;
     }
 
     private Map<String, Object> event(String type, Map<String, ?> data) {

@@ -18,8 +18,10 @@ if (-not (Test-Path $javaExe)) { throw "The configured Java runtime was not foun
 
 $env:MINECRAFT_RCON_PASSWORD_FILE = Join-Path $ServerDir "rcon-password.txt"
 $env:MINECRAFT_PLAYER = (Get-Content -Raw -LiteralPath (Join-Path $ServerDir "god-player.txt")).Trim()
-$env:MINECRAFT_ACTIVE_PLAYER_FILE = Join-Path $Root "state\active_player.txt"
-$env:MINECRAFT_STATE_FILE = Join-Path $Root "state\god_state.json"
+$env:MINECRAFT_EVENTS_FILE = Join-Path $Root "state\events.jsonl"
+$env:MINECRAFT_LEDGER_FILE = Join-Path $Root "state\god_ledger.sqlite3"
+$env:MINECRAFT_PROFILE_DIR = Join-Path $Root "state\players"
+$env:MINECRAFT_MAX_GODS = "32"
 $env:MINECRAFT_EVENT_BASE_URL = "http://127.0.0.1:8765"
 $npmCodex = Join-Path $env:APPDATA "npm\codex.cmd"
 if (Test-Path $npmCodex) { $env:CODEX_CLI_PATH = $npmCodex }
@@ -49,7 +51,7 @@ try {
             Start-Sleep -Milliseconds 500
         }
         if (-not $godReady) { throw "The god controller did not become ready. Check logs\god-controller.err.log." }
-        Write-Host "God controller is waiting for any player to join. The first player becomes active for this session."
+        Write-Host "God controller is waiting for players to join. Each player receives a persistent personal god."
         Write-Host "Starting Paper server. Connect from Minecraft Java Edition to localhost:25565."
         & $javaExe -Xms4G -Xmx4G -jar $paperJar --nogui
     } finally {

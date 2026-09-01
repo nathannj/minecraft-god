@@ -156,9 +156,9 @@ Write-Host "Registering the Minecraft God MCP server with Codex..."
 & codex mcp remove minecraft_god 2>$null
 & codex mcp add minecraft_god `
     --env "MINECRAFT_RCON_PASSWORD_FILE=$passwordFile" `
-    --env "MINECRAFT_PLAYER=$PlayerName" `
-    --env "MINECRAFT_ACTIVE_PLAYER_FILE=$(Join-Path $Root 'state\active_player.txt')" `
-    --env "MINECRAFT_STATE_FILE=$(Join-Path $Root 'state\god_state.json')" `
+    --env "MINECRAFT_EVENTS_FILE=$(Join-Path $Root 'state\events.jsonl')" `
+    --env "MINECRAFT_LEDGER_FILE=$(Join-Path $Root 'state\god_ledger.sqlite3')" `
+    --env "MINECRAFT_PROFILE_DIR=$(Join-Path $Root 'state\players')" `
     -- (Get-Command py).Source -3 (Join-Path $Root "run_bridge.py") --no-events
 
 if (-not $AcceptEula) {

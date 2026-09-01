@@ -2,7 +2,7 @@ name: MinecraftGodBridge
 version: ${version}
 main: com.minecraftgod.bridge.MinecraftGodPlugin
 api-version: '26.2'
-description: Sends selected Minecraft events to the local Minecraft God MCP bridge.
+description: Sends UUID-tagged Minecraft events to the local multi-god bridge.
 author: MinecraftGod
 commands:
   godscan:
@@ -13,6 +13,12 @@ commands:
     description: Return exact block properties at a coordinate for the Minecraft God.
     usage: /godcheck <player> <x> <y> <z>
     permission: minecraftgod.scan
+  pray:
+    description: Speak privately to your personal god.
+    usage: /pray <message>
+  whisper:
+    description: Speak privately to your personal god.
+    usage: /whisper god <message>
 permissions:
   minecraftgod.scan:
     description: Allow the bridge to inspect a local scene.
