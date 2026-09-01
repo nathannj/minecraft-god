@@ -230,6 +230,32 @@ def test_player_god_state_isolated_by_uuid(tmp_path):
     assert bob.get_god_state()["current_interest"] == ""
 
 
+def test_scoped_bridge_ignores_shared_legacy_state_and_active_player(tmp_path):
+    alice_id = str(uuid.uuid4())
+    bob_id = str(uuid.uuid4())
+    legacy_state = tmp_path / "god_state.json"
+    legacy_state.write_text(json.dumps({"current_interest": "IAmBoreder's shrine vow"}), encoding="utf-8")
+    active_file = tmp_path / "active_player.txt"
+    active_file.write_text("Bob", encoding="utf-8")
+    bridge, rcon = scoped_bridge(tmp_path, alice_id, "Alice")
+    bridge.config.active_player_file = str(active_file)
+    bridge.register_player(bob_id, "Bob")
+
+    assert bridge.current_player_name() == "Alice"
+    assert bridge.get_god_state()["current_interest"] == ""
+    whisper = call_tool(bridge, "whisper_player", {"message": "I see you."})
+    assert whisper["command"].startswith("tellraw Alice ")
+
+    bridge.record_event({"type": "chat", "player_uuid": bob_id, "player": "Bob", "message": "Bob's private words"})
+    bridge.record_event({"type": "chat", "player_uuid": alice_id, "player": "Alice", "message": "Alice's private words"})
+    assert [event["player"] for event in bridge.read_chat(10)] == ["Alice"]
+
+
+def test_scoped_bridge_fails_closed_without_owner(tmp_path):
+    with pytest.raises(ValueError, match="no player UUID"):
+        GodBridge(BridgeConfig(state_file=str(tmp_path / "state.json"), require_god_scope=True), rcon=FakeRcon())
+
+
 def test_player_god_cannot_target_another_player(tmp_path):
     alice_id = str(uuid.uuid4())
     bob_id = str(uuid.uuid4())

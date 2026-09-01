@@ -68,6 +68,29 @@ class Transcript:
 
 
 class CodexAppServer:
+    @staticmethod
+    def _toml_literal(value: str) -> str:
+        """Quote a string for a Codex TOML override without Windows escaping."""
+        return "'" + str(value).replace("'", "''") + "'"
+
+    @staticmethod
+    def build_command(codex_bin: str, environment: dict[str, str] | None = None) -> list[str]:
+        """Build an app-server command with MCP env overrides applied explicitly.
+
+        Codex app-server does not reliably forward arbitrary parent-process
+        environment variables to MCP children. The global minecraft_god MCP
+        registration is intentionally unscoped, so every dedicated god must
+        receive its scope through the app-server config itself as well.
+        """
+        command = [codex_bin, "app-server", "-c", "notify=[]"]
+        for name, value in (environment or {}).items():
+            command.extend([
+                "-c",
+                f"mcp_servers.minecraft_god.env.{name}={CodexAppServer._toml_literal(str(value))}",
+            ])
+        command.extend(["--listen", "stdio://"])
+        return command
+
     def __init__(self, cwd: Path, transcript: Transcript, environment: dict[str, str] | None = None) -> None:
         self.transcript = transcript
         # Prefer the npm-installed CLI because the desktop bundle can lag behind model availability.
@@ -79,7 +102,7 @@ class CodexAppServer:
             # The normal desktop notification hook receives the full turn
             # payload. On Windows that can exceed the command-line limit;
             # this autonomous controller does not need desktop notifications.
-            [codex_bin, "app-server", "-c", "notify=[]", "--listen", "stdio://"],
+            self.build_command(codex_bin, environment),
             cwd=str(cwd),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -266,13 +289,17 @@ class GodSession:
         self.player_name = player_name
         self.transcript = transcript
         self.idle_seconds = idle_seconds
+        self.profile_dir = root / "state" / "players" / player_id
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.codex = CodexAppServer(root, transcript, {
             "MINECRAFT_GOD_PLAYER_ID": player_id,
             "MINECRAFT_GOD_PLAYER": player_name,
             "MINECRAFT_EVENTS_FILE": str(root / "state" / "events.jsonl"),
             "MINECRAFT_LEDGER_FILE": str(root / "state" / "god_ledger.sqlite3"),
             "MINECRAFT_PROFILE_DIR": str(root / "state" / "players"),
-            "MINECRAFT_STATE_FILE": str(root / "state" / "players" / player_id / "god_state.json"),
+            "MINECRAFT_STATE_FILE": str(self.profile_dir / "god_state.json"),
+            "MINECRAFT_ACTIVE_PLAYER_FILE": str(self.profile_dir / "active_player.txt"),
+            "MINECRAFT_REQUIRE_GOD_SCOPE": "true",
         })
         self.thread_id = ""
         self._pending: deque[dict[str, Any]] = deque(maxlen=64)
@@ -289,9 +316,13 @@ class GodSession:
         self.codex.request("initialize", {"clientInfo": {"name": "minecraft_god_controller", "title": "Minecraft God Controller", "version": "0.2.0"}})
         self.codex.notify("initialized")
         thread = self.codex.request("thread/start", {
-            "cwd": str(ROOT),
+            "cwd": str(self.profile_dir),
             "model": os.getenv("MINECRAFT_GOD_MODEL", "gpt-5.6-luna"),
             "approvalPolicy": "never",
+            # The Minecraft MCP actions are the god's controlled capability;
+            # Codex currently requires the full sandbox mode for these tools
+            # to run with approvalPolicy=never. The prompt forbids shell/file
+            # state access, while the bridge enforces player ownership.
             "sandbox": "danger-full-access",
         })
         self.thread_id = thread["thread"]["id"]

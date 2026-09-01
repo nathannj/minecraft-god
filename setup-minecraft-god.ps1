@@ -159,6 +159,7 @@ Write-Host "Registering the Minecraft God MCP server with Codex..."
     --env "MINECRAFT_EVENTS_FILE=$(Join-Path $Root 'state\events.jsonl')" `
     --env "MINECRAFT_LEDGER_FILE=$(Join-Path $Root 'state\god_ledger.sqlite3')" `
     --env "MINECRAFT_PROFILE_DIR=$(Join-Path $Root 'state\players')" `
+    --env "MINECRAFT_REQUIRE_GOD_SCOPE=true" `
     -- (Get-Command py).Source -3 (Join-Path $Root "run_bridge.py") --no-events
 
 if (-not $AcceptEula) {

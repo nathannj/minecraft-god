@@ -63,6 +63,7 @@ class BridgeConfig:
     events_file: str | None = None
     ledger_file: str | None = None
     max_gods: int = 32
+    require_god_scope: bool = False
     dry_run: bool = False
     max_command_length: int = 512
     camera_output_dir: str = "state/captures"
@@ -190,8 +191,10 @@ class GodBridge:
         self._lock = threading.RLock()
         self._events: deque[dict[str, Any]] = deque(maxlen=100)
         self._chat: deque[dict[str, Any]] = deque(maxlen=50)
-        configured_state = Path(config.state_file)
+        configured_state = self._absolute_path(config.state_file)
         self._owner_id = self._normalize_owner_id(config.god_player_id)
+        if config.require_god_scope and not self._owner_id:
+            raise ValueError("MINECRAFT_REQUIRE_GOD_SCOPE is enabled but no player UUID was provided")
         self._profile_dir = self._absolute_path(config.profile_dir)
         if self._owner_id:
             self._state_path = self._profile_dir / self._profile_key(self._owner_id) / "god_state.json"

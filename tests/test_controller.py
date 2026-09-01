@@ -34,6 +34,17 @@ def test_minecraft_god_server_requests_are_auto_accepted():
     assert CodexAppServer._server_request_response("unknown/request", {}) is None
 
 
+def test_app_server_command_overrides_mcp_scope():
+    command = CodexAppServer.build_command("codex", {
+        "MINECRAFT_GOD_PLAYER_ID": "alice-id",
+        "MINECRAFT_GOD_PLAYER": "Alice",
+        "MINECRAFT_REQUIRE_GOD_SCOPE": "true",
+    })
+    assert "mcp_servers.minecraft_god.env.MINECRAFT_GOD_PLAYER_ID='alice-id'" in command
+    assert "mcp_servers.minecraft_god.env.MINECRAFT_GOD_PLAYER='Alice'" in command
+    assert "mcp_servers.minecraft_god.env.MINECRAFT_REQUIRE_GOD_SCOPE='true'" in command
+
+
 def test_controller_batches_events_that_arrive_while_god_is_thinking():
     pending = deque([
         {"type": "chat", "message": "first"},

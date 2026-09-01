@@ -390,7 +390,7 @@ def config_from_env(config_file: str | None = None) -> BridgeConfig:
         values = json.loads(Path(config_file).read_text(encoding="utf-8"))
         if not isinstance(values, dict):
             raise ValueError("config file must contain a JSON object")
-        for field in ("rcon_host", "rcon_port", "rcon_password", "player_name", "god_player_id", "god_player_name", "profile_dir", "active_player_file", "event_host", "event_port", "event_token", "state_file", "events_file", "ledger_file", "max_gods", "dry_run", "max_command_length", "camera_output_dir", "camera_plugin_render_dir", "camera_timeout", "structure_catalog_file", "structure_datapacks_dir", "structure_download_dir", "structure_max_download_mb", "minecraft_version"):
+        for field in ("rcon_host", "rcon_port", "rcon_password", "player_name", "god_player_id", "god_player_name", "profile_dir", "active_player_file", "event_host", "event_port", "event_token", "state_file", "events_file", "ledger_file", "max_gods", "require_god_scope", "dry_run", "max_command_length", "camera_output_dir", "camera_plugin_render_dir", "camera_timeout", "structure_catalog_file", "structure_datapacks_dir", "structure_download_dir", "structure_max_download_mb", "minecraft_version"):
             if field in values:
                 setattr(config, field, values[field])
 
@@ -410,6 +410,7 @@ def config_from_env(config_file: str | None = None) -> BridgeConfig:
         "MINECRAFT_EVENTS_FILE": ("events_file", str),
         "MINECRAFT_LEDGER_FILE": ("ledger_file", str),
         "MINECRAFT_MAX_GODS": ("max_gods", int),
+        "MINECRAFT_REQUIRE_GOD_SCOPE": ("require_god_scope", lambda value: str(value).lower() in {"1", "true", "yes"}),
         "MINECRAFT_MAX_COMMAND_LENGTH": ("max_command_length", int),
         "MINECRAFT_CAMERA_OUTPUT_DIR": ("camera_output_dir", str),
         "MINECRAFT_CAMERA_PLUGIN_RENDER_DIR": ("camera_plugin_render_dir", str),
