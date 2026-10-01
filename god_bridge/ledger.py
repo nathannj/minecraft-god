@@ -64,6 +64,14 @@ class GodLedger:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS players_name_ci ON players(lower(name));
 
+            CREATE TABLE IF NOT EXISTS player_aliases (
+                alias TEXT PRIMARY KEY,
+                player_id TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS player_aliases_player ON player_aliases(player_id);
+            INSERT OR IGNORE INTO player_aliases(alias, player_id)
+                SELECT lower(name), player_id FROM players;
+
             CREATE TABLE IF NOT EXISTS interactions (
                 id TEXT PRIMARY KEY,
                 kind TEXT NOT NULL,
@@ -88,6 +96,18 @@ class GodLedger:
                 name TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS event_dedup (
+                dedupe_key TEXT PRIMARY KEY,
+                event_id INTEGER NOT NULL,
+                event_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS action_dedup (
+                idempotency_key TEXT PRIMARY KEY,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -109,13 +129,97 @@ class GodLedger:
             connection.execute("ROLLBACK")
             raise
 
+    def reserve_event(
+        self,
+        event: dict[str, Any],
+        *,
+        dedupe_key: str = "",
+        minimum: int = 0,
+    ) -> tuple[dict[str, Any], bool]:
+        """Allocate an event id once, or return the prior event for a retry.
+
+        The event hub and multiple god bridges can see the same source event.
+        Keeping this claim in SQLite makes retries safe across processes rather
+        than relying on each bridge's in-memory buffer.
+        """
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if dedupe_key:
+                existing = connection.execute(
+                    "SELECT event_json FROM event_dedup WHERE dedupe_key=?", (dedupe_key,)
+                ).fetchone()
+                if existing:
+                    connection.execute("COMMIT")
+                    return json.loads(existing[0]), False
+
+            row = connection.execute("SELECT value FROM sequences WHERE name='events'").fetchone()
+            current = max(int(row[0]) if row else 0, int(minimum)) + 1
+            clean = dict(event)
+            clean["event_id"] = current
+            connection.execute(
+                "INSERT INTO sequences(name, value) VALUES('events', ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                (current,),
+            )
+            if dedupe_key:
+                connection.execute(
+                    "INSERT INTO event_dedup(dedupe_key, event_id, event_json) VALUES (?, ?, ?)",
+                    (dedupe_key, current, json.dumps(clean, separators=(",", ":"))),
+                )
+            connection.execute("COMMIT")
+            return clean, True
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+    def cached_action(self, idempotency_key: str) -> dict[str, Any] | None:
+        row = self._connection().execute(
+            "SELECT result_json FROM action_dedup WHERE idempotency_key=?",
+            (str(idempotency_key),),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row[0])
+        except json.JSONDecodeError:
+            return None
+
+    def cached_event(self, dedupe_key: str) -> dict[str, Any] | None:
+        row = self._connection().execute(
+            "SELECT event_json FROM event_dedup WHERE dedupe_key=?", (str(dedupe_key),)
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row[0])
+        except json.JSONDecodeError:
+            return None
+
+    def remember_action(self, idempotency_key: str, result: dict[str, Any]) -> None:
+        self._connection().execute(
+            "INSERT OR IGNORE INTO action_dedup(idempotency_key, result_json, created_at) VALUES (?, ?, ?)",
+            (str(idempotency_key), json.dumps(result, separators=(",", ":")), utc_now()),
+        )
+
     def register_player(self, player_id: str, name: str, *, online: bool = True) -> dict[str, Any]:
         player_id = str(player_id).strip().lower()
         name = str(name).strip()
         if not player_id or not name:
             raise ValueError("player_id and name are required")
-        now = utc_now()
+        alias = name.casefold()
         connection = self._connection()
+        existing_alias = connection.execute(
+            "SELECT player_id FROM player_aliases WHERE alias=?", (alias,)
+        ).fetchone()
+        if existing_alias and str(existing_alias[0]).lower() != player_id:
+            raise ValueError(f"player name is already associated with another player: {name}")
+        existing_name = connection.execute(
+            "SELECT player_id FROM players WHERE lower(name)=lower(?)", (name,)
+        ).fetchone()
+        if existing_name and str(existing_name[0]).lower() != player_id:
+            raise ValueError(f"player name is already associated with another player: {name}")
+        now = utc_now()
         connection.execute(
             """
             INSERT INTO players(player_id, name, first_seen, last_seen, online)
@@ -123,6 +227,10 @@ class GodLedger:
             ON CONFLICT(player_id) DO UPDATE SET name=excluded.name, last_seen=excluded.last_seen, online=excluded.online
             """,
             (player_id, name, now, now, int(online)),
+        )
+        connection.execute(
+            "INSERT INTO player_aliases(alias, player_id) VALUES (?, ?) ON CONFLICT(alias) DO UPDATE SET player_id=excluded.player_id",
+            (alias, player_id),
         )
         return self.player(player_id) or {"player_id": player_id, "name": name, "online": online}
 
@@ -137,8 +245,14 @@ class GodLedger:
             return None
         connection = self._connection()
         row = connection.execute(
-            "SELECT player_id, name, first_seen, last_seen, online FROM players WHERE player_id=? OR lower(name)=lower(?) LIMIT 1",
-            (reference.lower(), reference),
+            """
+            SELECT p.player_id, p.name, p.first_seen, p.last_seen, p.online
+            FROM players p
+            LEFT JOIN player_aliases a ON a.player_id=p.player_id
+            WHERE p.player_id=? OR lower(p.name)=lower(?) OR a.alias=lower(?)
+            LIMIT 1
+            """,
+            (reference.lower(), reference, reference),
         ).fetchone()
         return dict(row) if row else None
 

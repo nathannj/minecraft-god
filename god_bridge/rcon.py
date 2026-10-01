@@ -62,19 +62,31 @@ class RconClient:
         """Run a command and assemble Paper's multi-packet response.
 
         Paper sends command output in chunks of up to 4096 characters.  A
-        second, empty command acts as an in-order sentinel, allowing us to
-        know when every chunk for the real command has arrived.
+        second, harmless `list` command acts as an in-order sentinel, allowing
+        us to know when every chunk for the real command has arrived. Paper
+        may close an RCON connection when sent an empty command, especially
+        after plugin-defined commands, so an empty sentinel is not reliable.
         """
         request_id = random.randint(1, 2_000_000_000)
         sentinel_id = random.randint(1, 2_000_000_000)
         while sentinel_id == request_id:
             sentinel_id = random.randint(1, 2_000_000_000)
         sock.sendall(encode_packet(request_id, SERVERDATA_EXECCOMMAND, command))
-        sock.sendall(encode_packet(sentinel_id, SERVERDATA_EXECCOMMAND, ""))
+        sock.sendall(encode_packet(sentinel_id, SERVERDATA_EXECCOMMAND, "list"))
 
         chunks: list[str] = []
         while True:
-            response = self._read_packet(sock)
+            try:
+                response = self._read_packet(sock)
+            except (ConnectionError, TimeoutError, socket.timeout):
+                # Some Paper builds return every packet for the real command
+                # and then close or stop responding instead of acknowledging
+                # the empty sentinel. The command result is still complete and
+                # must not be discarded merely because that optional marker is
+                # absent. With no result packets, preserve the original error.
+                if chunks:
+                    break
+                raise
             if response.request_id == sentinel_id:
                 break
             if response.request_id == request_id:

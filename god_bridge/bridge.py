@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import difflib
 import math
 import os
 import re
@@ -16,11 +17,44 @@ from typing import Any, Callable
 
 from .rcon import RconClient
 from .ledger import GodLedger, expiry_after
+from .story import DIRECT_GOD_ADDRESS, compact_event
 from .structures import StructureLibrary
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def normalize_dimension(value: str) -> str:
+    dimension = str(value or "minecraft:overworld").strip().casefold()
+    aliases = {
+        "overworld": "minecraft:overworld",
+        "world": "minecraft:overworld",
+        "nether": "minecraft:the_nether",
+        "the_nether": "minecraft:the_nether",
+        "world_nether": "minecraft:the_nether",
+        "end": "minecraft:the_end",
+        "the_end": "minecraft:the_end",
+        "world_the_end": "minecraft:the_end",
+    }
+    dimension = aliases.get(dimension, dimension)
+    if not re.fullmatch(r"[a-z0-9_.-]+:[a-z0-9_./-]+", dimension):
+        raise ValueError("dimension must be a namespaced Minecraft dimension")
+    return dimension
+
+
+def absolute_block_position(value: str) -> tuple[int, int, int]:
+    position = parse_position(value)
+    if "~" in position:
+        raise ValueError("remote positions must use absolute coordinates")
+    return tuple(int(float(token)) for token in position.split())  # type: ignore[return-value]
+
+
+def landmark_key(value: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "_", str(value or "").casefold()).strip("_")
+    if not key:
+        raise ValueError("landmark name is required")
+    return key[:64]
 
 
 def _epoch_string(value: float) -> str:
@@ -56,6 +90,7 @@ class BridgeConfig:
     god_player_name: str = ""
     profile_dir: str = "state/players"
     active_player_file: str = "state/active_player.txt"
+    turn_context_file: str = "state/turn_context.json"
     event_host: str = "127.0.0.1"
     event_port: int = 8765
     event_token: str = ""
@@ -74,6 +109,7 @@ class BridgeConfig:
     structure_download_dir: str = "state/structure_downloads"
     structure_max_download_mb: int = 64
     minecraft_version: str = "26.2"
+    repeated_speech_cooldown: int = 600
 
 
 DEFAULT_GOD_STATE = {
@@ -85,12 +121,43 @@ DEFAULT_GOD_STATE = {
     "current_plan": "",
     "chaos_budget": "low",
     "last_major_intervention": "",
+    "story_phase": "dormant",
+    "active_thread": "",
+    "player_choice": "",
+    "story_watches": [],
+    "story_objectives": [],
+    "landmarks": {},
+    "next_eligible_intervention_at": "",
+    "last_player_visible_message": {},
+    "last_spoken_turn_id": "",
+    "last_world_impact": "",
+    "unresolved_promises": [],
     "conduct_score": 0,
     "conduct_window_started_at": "",
     "last_consequence_at": "",
     "consequence_count": 0,
     "memories": [],
 }
+
+MAX_MEMORIES = 64
+MAX_LANDMARKS = 64
+MAX_OBJECTIVES = 24
+WATCH_KINDS = {
+    "event", "region", "item", "block_place", "block_break", "health_below",
+    "mob_kill", "structure_change", "all", "any",
+}
+
+SIGN_COLORS = {
+    "black", "blue", "green", "cyan", "red", "purple", "yellow", "white",
+    "orange", "magenta", "lime", "light_blue", "pink", "gray", "light_gray", "brown",
+}
+MESSAGE_TYPES = {"intent", "report", "request", "warning", "verified_fact", "uncertain_claim", "approval"}
+
+
+def _sign_line_width(text: str) -> int:
+    narrow = set(" ilI!.,:;'|")
+    wide = set("mwMW")
+    return sum((2 if character in narrow else 7 if character in wide else 5) + 1 for character in text) - (1 if text else 0)
 
 
 def _format_number(value: float) -> str:
@@ -114,6 +181,7 @@ def _camera_points(scan: dict[str, Any]) -> list[tuple[str, tuple[str, float, fl
             fallback = (0.0, 64.0, 0.0)
 
     positions: list[tuple[float, float, float]] = []
+    occluders: set[tuple[int, int, int]] = set()
     for block in scan.get("blocks", []):
         if not isinstance(block, dict):
             continue
@@ -121,7 +189,11 @@ def _camera_points(scan: dict[str, Any]) -> list[tuple[str, tuple[str, float, fl
         if len(raw_position) < 3:
             continue
         try:
-            positions.append(tuple(float(value) for value in raw_position[:3]))  # type: ignore[arg-type]
+            parsed = tuple(float(value) for value in raw_position[:3])
+            positions.append(parsed)  # type: ignore[arg-type]
+            block_type = str(block.get("type", ""))
+            if not any(token in block_type for token in ("glass", "air", "water")):
+                occluders.add(tuple(int(value) for value in parsed))
         except ValueError:
             continue
     if not positions:
@@ -143,12 +215,30 @@ def _camera_points(scan: dict[str, Any]) -> list[tuple[str, tuple[str, float, fl
         "minecraft:the_end": "world_the_end",
     }.get(dimension, dimension.removeprefix("minecraft:"))
 
-    views: list[tuple[str, float, float]] = [("front-right", 1.0, 1.0), ("back-left", -1.0, -1.0)]
+    candidates: list[tuple[int, float, float, float]] = []
+    camera_y = target[1] + max(5.0, extent * 0.7)
+    for index in range(8):
+        angle = math.radians(index * 45.0)
+        camera_x = target[0] + math.cos(angle) * distance
+        camera_z = target[2] + math.sin(angle) * distance
+        score = 0
+        for step in range(2, 17):
+            ratio = step / 20.0
+            point = (
+                int(camera_x + (target[0] - camera_x) * ratio),
+                int(camera_y + (target[1] - camera_y) * ratio),
+                int(camera_z + (target[2] - camera_z) * ratio),
+            )
+            if point in occluders:
+                score += 1
+        candidates.append((score, index, camera_x, camera_z))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    first = candidates[0]
+    opposite = [item for item in candidates[1:] if abs(int(item[1]) - int(first[1])) in {3, 4, 5}]
+    second = min(opposite or candidates[1:], key=lambda item: (item[0], item[1]))
+    views = [("front-right", first[2], first[3]), ("back-left", second[2], second[3])]
     result: list[tuple[str, tuple[str, float, float, float, float, float]]] = []
-    for name, x_sign, z_sign in views:
-        camera_x = target[0] + x_sign * distance
-        camera_z = target[2] + z_sign * distance
-        camera_y = target[1] + max(4.0, extent * 0.55)
+    for name, camera_x, camera_z in views:
         dx = target[0] - camera_x
         dy = target[1] - camera_y
         dz = target[2] - camera_z
@@ -239,10 +329,37 @@ class GodBridge:
         return {"player_id": self._owner_id, "name": name, "online": bool((profile or {}).get("online", False))}
 
     def _resolve_player(self, reference: str) -> dict[str, Any]:
+        reference = str(reference or "").strip()
         profile = self._ledger.player(reference)
-        if not profile:
-            raise ValueError(f"unknown player profile: {reference}")
-        return profile
+        if profile:
+            profile = dict(profile)
+            profile["resolved_reference"] = reference
+            profile["match_method"] = "canonical_id_or_alias"
+            return profile
+        if reference and not re.fullmatch(r"[0-9a-f-]{16,}", reference.casefold()):
+            candidates = self._ledger.players()
+            scored = sorted(
+                ((difflib.SequenceMatcher(None, reference.casefold(), str(item["name"]).casefold()).ratio(), item) for item in candidates),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            if scored and scored[0][0] >= 0.84 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
+                profile = dict(scored[0][1])
+                profile["resolved_reference"] = reference
+                profile["match_method"] = "unambiguous_name_correction"
+                return profile
+        known = ", ".join(str(item["name"]) for item in self._ledger.players()) or "none registered"
+        raise ValueError(f"unknown player profile: {reference}. Known players: {known}")
+
+    @staticmethod
+    def _event_dedupe_key(event: dict[str, Any]) -> str:
+        explicit = event.get("dedupe_key")
+        if explicit not in {None, ""}:
+            return f"explicit:{explicit}"
+        source = event.get("event_id")
+        if source not in {None, ""}:
+            return f"source:{event.get('type', 'unknown')}:{source}"
+        return ""
 
     def owned_player(self, reference: str = "") -> dict[str, Any]:
         owner_id = self._require_owner()
@@ -265,6 +382,14 @@ class GodBridge:
         state = json.loads(json.dumps(DEFAULT_GOD_STATE))
         if isinstance(loaded, dict):
             state.update(loaded)
+        if not isinstance(state.get("memories"), list):
+            state["memories"] = []
+        if not isinstance(state.get("story_watches"), list):
+            state["story_watches"] = []
+        if not isinstance(state.get("story_objectives"), list):
+            state["story_objectives"] = []
+        if not isinstance(state.get("landmarks"), dict):
+            state["landmarks"] = {}
         return state
 
     def _state_path_for(self, player_id: str) -> Path:
@@ -308,6 +433,16 @@ class GodBridge:
         clean = dict(event)
         clean.setdefault("type", "unknown")
         clean.setdefault("at", utc_now())
+        clean.setdefault("source", "paper" if clean["type"] in {
+            "chat", "player_chat", "player_prayer", "player_join", "player_quit",
+            "player_death", "dimension_change", "advancement", "explosion_near_player",
+            "player_snapshot", "block_place", "block_break", "mob_kill", "health_threshold",
+        } else "external")
+        dedupe_key = self._event_dedupe_key(clean)
+        if dedupe_key:
+            cached = self._ledger.cached_event(dedupe_key)
+            if cached:
+                return cached
         for id_key, name_key in (("player_uuid", "player"), ("victim_uuid", "victim"), ("killer_uuid", "killer")):
             player_id = str(clean.get(id_key, "") or "").strip().lower()
             player_name = str(clean.get(name_key, "") or "").strip()
@@ -321,7 +456,8 @@ class GodBridge:
         consequence_player_id = ""
         consequence_state = self._god_state
         consequence_path = self._state_path
-        if clean.get("type") in {"chat", "player_chat"} and isinstance(clean.get("message"), str):
+        directed_abuse = bool(clean.get("private")) or bool(DIRECT_GOD_ADDRESS.search(str(clean.get("message", ""))))
+        if clean.get("type") in {"chat", "player_chat", "player_prayer"} and directed_abuse and isinstance(clean.get("message"), str):
             player = str(clean.get("player", ""))
             player_id = self._event_player_id(clean)
             is_owner_event = bool(player_id and player_id == self._owner_id) or (not self._owner_id and player.casefold() == self.current_player_name().casefold())
@@ -356,9 +492,13 @@ class GodBridge:
                     clean["conduct"]["consequence_level"] = consequence_level
         with self._lock:
             supplied_event_id = clean.pop("event_id", None)
+            clean.pop("dedupe_key", None)
             if supplied_event_id is not None:
                 clean["source_event_id"] = supplied_event_id
-            clean["event_id"] = self._ledger.next_event_id(self._next_event_id - 1)
+            reserved, is_new = self._ledger.reserve_event(clean, dedupe_key=dedupe_key, minimum=self._next_event_id - 1)
+            if not is_new:
+                return reserved
+            clean = reserved
             self._next_event_id = max(self._next_event_id, int(clean["event_id"]) + 1)
             self._events.append(clean)
             if clean["type"] in {"chat", "player_chat"} or "message" in clean:
@@ -426,7 +566,7 @@ class GodBridge:
         self._assert_command_authorized(command, target_player_id=target_player_id, capability=capability)
         return self.execute(command, record=True, target_player_id=target_player_id, capability=capability)
 
-    def execute(self, command: str, *, record: bool = True, target_player_id: str = "", capability: bool = False, allow_shared: bool = False) -> dict[str, Any]:
+    def execute(self, command: str, *, record: bool = True, target_player_id: str = "", capability: bool = False, allow_shared: bool = False, idempotency_key: str = "") -> dict[str, Any]:
         if not isinstance(command, str) or not command.strip():
             raise ValueError("command must be a non-empty string")
         if len(command) > self.config.max_command_length:
@@ -435,6 +575,15 @@ class GodBridge:
             raise ValueError("command cannot contain newlines or NUL bytes")
         command = command.strip().lstrip("/")
         self._assert_command_authorized(command, target_player_id=target_player_id, capability=capability, allow_shared=allow_shared)
+        self._validate_command_preflight(command)
+        if idempotency_key:
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", idempotency_key):
+                raise ValueError("idempotency_key must contain only letters, numbers, dot, underscore, colon, or hyphen")
+            cached = self._ledger.cached_action(idempotency_key)
+            if cached:
+                replay = dict(cached)
+                replay["idempotent_replay"] = True
+                return replay
         if self.config.dry_run:
             result = {"command": command, "ok": True, "dry_run": True, "output": ""}
         else:
@@ -448,14 +597,62 @@ class GodBridge:
             }
             if not result["ok"]:
                 result["error"] = "Minecraft rejected the command or found no matching target."
+        if idempotency_key:
+            self._ledger.remember_action(idempotency_key, result)
         if record:
-            action_event: dict[str, Any] = {"type": "god_action", "command": command, "result": result.get("output", "")}
+            action_event: dict[str, Any] = {
+                "type": "god_action",
+                "source": "god",
+                "wake_policy": "never",
+                "command": command,
+                "result": result.get("output", ""),
+            }
+            context = self._turn_context()
+            if context.get("turn_id"):
+                action_event["caused_by_turn_id"] = context["turn_id"]
             if self._owner_id:
                 action_event.update({"player_uuid": self._owner_id, "player": self.current_player_name()})
             if target_player_id:
                 action_event["target_player_id"] = target_player_id
+            if idempotency_key:
+                action_event["idempotency_key"] = idempotency_key
             self.record_event(action_event)
         return result
+
+    def _validate_command_preflight(self, command: str) -> None:
+        """Reject known-invalid command shapes before spending an RCON round trip."""
+        lowered = command.casefold()
+        if "front_text:" in lowered:
+            color = re.search(r"(?:^|[,{}])color\s*:\s*['\"]?([a-z_]+)", lowered)
+            if color and color.group(1) not in SIGN_COLORS:
+                raise ValueError(f"unsupported sign color '{color.group(1)}'; use a vanilla dye color")
+            messages = re.search(r"messages\s*:\s*\[([^\]]*)\]", command, re.IGNORECASE)
+            if messages:
+                lines = re.findall(r"'((?:\\'|[^'])*)'|\"((?:\\\"|[^\"])*)\"", messages.group(1))
+                for index, pair in enumerate(lines, start=1):
+                    line = next((part for part in pair if part != ""), "")
+                    if len(line) > 15:
+                        raise ValueError(f"sign line {index} exceeds 15 characters")
+                    if _sign_line_width(line) > 90:
+                        raise ValueError(f"sign line {index} exceeds the 90-pixel sign width")
+
+    def preflight_command(self, command: str) -> dict[str, Any]:
+        """Return the cheap, non-mutating checks used before raw commands."""
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command must be a non-empty string")
+        if len(command) > self.config.max_command_length:
+            raise ValueError(f"command exceeds {self.config.max_command_length} characters")
+        if any(char in command for char in "\r\n\x00"):
+            raise ValueError("command cannot contain newlines or NUL bytes")
+        normalized = command.strip().lstrip("/")
+        self._assert_command_authorized(normalized)
+        self._validate_command_preflight(normalized)
+        checks = ["single_line", "length_limit", "ownership_scope"]
+        if "front_text:" in normalized.casefold():
+            checks.append("sign_text_and_color")
+        if re.search(r"\b(?:setblock|fill|summon|tp|place)\b", normalized.casefold()):
+            checks.append("coordinate_command_shape")
+        return {"ok": True, "command": normalized, "checks": checks, "mutating": True}
 
     def command_at_player(self, command: str) -> str:
         """Run a command with the active player as both executor and position anchor.
@@ -469,8 +666,8 @@ class GodBridge:
 
     def inspect_area(self, radius: int = 8, vertical_radius: int = 5) -> dict[str, Any]:
         """Return the Paper plugin's exact local scene scan, if available."""
-        radius = max(1, min(int(radius), 12))
-        vertical_radius = max(1, min(int(vertical_radius), 8))
+        radius = max(1, min(int(radius), 24))
+        vertical_radius = max(1, min(int(vertical_radius), 16))
         result = self.execute(
             f"godscan {self.current_player_name()} {radius} {vertical_radius}",
             record=False,
@@ -485,10 +682,43 @@ class GodBridge:
             return {"ok": False, "error": scan.get("error"), "scan": scan}
         return {"ok": True, "scan": scan}
 
-    def inspect_block(self, position: str) -> dict[str, Any]:
-        """Inspect one exact block in the tracked player's current dimension."""
-        x, y, z = self.resolve_block_position(position)
-        result = self.execute(f"godcheck {self.current_player_name()} {x} {y} {z}", record=False)
+    def inspect_area_at(
+        self,
+        position: str,
+        dimension: str = "minecraft:overworld",
+        radius: int = 8,
+        vertical_radius: int = 5,
+    ) -> dict[str, Any]:
+        """Inspect a remembered or chosen location without moving the player."""
+        x, y, z = absolute_block_position(position)
+        dimension = normalize_dimension(dimension)
+        radius = max(1, min(int(radius), 24))
+        vertical_radius = max(1, min(int(vertical_radius), 16))
+        result = self.execute(
+            f"godscanat {dimension} {x} {y} {z} {radius} {vertical_radius}",
+            record=False,
+            allow_shared=True,
+        )
+        if not result["ok"]:
+            return {"ok": False, "error": result.get("output", "")}
+        try:
+            scan = json.loads(result.get("output", ""))
+        except json.JSONDecodeError:
+            return {"ok": False, "error": "godscanat returned non-JSON output", "output": result.get("output", "")}
+        if isinstance(scan, dict) and scan.get("error"):
+            return {"ok": False, "error": scan.get("error"), "scan": scan}
+        return {"ok": True, "scan": scan, "remote": True}
+
+    def inspect_block(self, position: str, dimension: str = "") -> dict[str, Any]:
+        """Inspect one exact block locally or in an explicitly named dimension."""
+        if dimension:
+            x, y, z = absolute_block_position(position)
+            dimension = normalize_dimension(dimension)
+            command = f"godcheckat {dimension} {x} {y} {z}"
+        else:
+            x, y, z = self.resolve_block_position(position)
+            command = f"godcheck {self.current_player_name()} {x} {y} {z}"
+        result = self.execute(command, record=False, allow_shared=bool(dimension))
         if not result["ok"]:
             return {"ok": False, "error": result.get("output", "godcheck failed"), "position": [x, y, z]}
         try:
@@ -496,6 +726,17 @@ class GodBridge:
         except json.JSONDecodeError:
             return {"ok": False, "error": "godcheck returned non-JSON output", "output": result.get("output", "")}
         return {"ok": True, "block": block}
+
+    def inspect_blocks(self, positions: list[str], dimension: str = "") -> dict[str, Any]:
+        """Batch exact block checks into one model-visible operation."""
+        if not isinstance(positions, list) or not positions or len(positions) > 128:
+            raise ValueError("positions must contain between 1 and 128 coordinate strings")
+        results = [self.inspect_block(position, dimension) for position in positions]
+        return {
+            "ok": all(result.get("ok") for result in results),
+            "dimension": normalize_dimension(dimension) if dimension else "player_current_dimension",
+            "results": results,
+        }
 
     def capture_scene(
         self,
@@ -512,6 +753,20 @@ class GodBridge:
         is never moved, used as a camera, or notified.
         """
         scene = self.inspect_area(radius, vertical_radius)
+        return self._capture_scanned_scene(scene)
+
+    def capture_scene_at(
+        self,
+        position: str,
+        dimension: str = "minecraft:overworld",
+        radius: int = 12,
+        vertical_radius: int = 8,
+    ) -> dict[str, Any]:
+        """Capture a private remote landmark view without moving the player."""
+        scene = self.inspect_area_at(position, dimension, radius, vertical_radius)
+        return self._capture_scanned_scene(scene)
+
+    def _capture_scanned_scene(self, scene: dict[str, Any]) -> dict[str, Any]:
         if not scene.get("ok"):
             return {"ok": False, "error": "Could not capture because the live scene scan failed.", "scene": scene}
 
@@ -602,20 +857,42 @@ class GodBridge:
             return active_name
         return self.config.player_name
 
+    def teleport_preflight(self, position: str, dimension: str = "") -> dict[str, Any]:
+        """Perform a quick destination check before moving the owned player."""
+        x, y, z = absolute_block_position(position) if dimension else self.resolve_block_position(position)
+        if self.config.dry_run:
+            return {"ok": None, "status": "dry-run", "position": [x, y, z], "checks": []}
+        checks = []
+        for label, block_position in (
+            ("feet", (x, y, z)),
+            ("head", (x, y + 1, z)),
+            ("support", (x, y - 1, z)),
+        ):
+            inspected = self.inspect_block("%d %d %d" % block_position, dimension)
+            if not inspected.get("ok"):
+                return {"ok": False, "status": "inspection-failed", "failed_check": label, "checks": checks, "error": inspected.get("error", "destination inspection failed")}
+            block = inspected.get("block", {})
+            checks.append({"name": label, "position": list(block_position), "block": block})
+            if label in {"feet", "head"} and (block.get("liquid") or not block.get("passable", False)):
+                return {"ok": False, "status": "occupied-or-liquid", "failed_check": label, "position": [x, y, z], "checks": checks}
+            if label == "support" and (block.get("liquid") or not block.get("solid", False)):
+                return {"ok": False, "status": "unsupported", "failed_check": label, "position": [x, y, z], "checks": checks}
+        return {"ok": True, "status": "safe", "position": [x, y, z], "checks": checks}
+
     def register_player(self, player_id: str, name: str, *, online: bool = True) -> dict[str, Any]:
         return self._ledger.register_player(player_id, name, online=online)
 
     def player_profiles(self) -> list[dict[str, Any]]:
         return self._ledger.players()
 
-    def observe_world(self) -> dict[str, Any]:
+    def observe_world(self, include_scene: bool = False) -> dict[str, Any]:
         player_name = self.current_player_name()
         observation: dict[str, Any] = {
             "observed_at": utc_now(),
             "player": player_name,
             "god_state": self.get_god_state(),
-            "recent_events": self.recent_events(8),
-            "recent_chat": self.read_chat(8),
+            "recent_events": self.recent_story_events(6),
+            "recent_chat": [compact_event(event) for event in self.read_chat(4)],
         }
         if self.config.dry_run:
             observation["connection"] = "dry_run"
@@ -634,14 +911,40 @@ class GodBridge:
                 observation["queries"][name] = self.execute(command, record=False)["output"]
             except Exception as exc:  # observation should degrade gracefully
                 observation["queries"][name] = {"error": str(exc)}
-        # Keep the high-level observation useful on its own.  Older plugin
-        # installations may not have /godscan yet, so this is deliberately
-        # additive and degrades to a clear capability error.
-        try:
-            observation["scene"] = self.inspect_area()
-        except Exception as exc:
-            observation["scene"] = {"ok": False, "error": str(exc)}
+        raw_position = str(observation["queries"].get("position", ""))
+        coordinates = re.findall(r"(-?\d+(?:\.\d+)?)d", raw_position)
+        current_dimension = ""
+        dimension_match = re.search(r"minecraft:[a-z0-9_./-]+", str(observation["queries"].get("dimension", "")), re.IGNORECASE)
+        if dimension_match:
+            current_dimension = dimension_match.group(0).casefold()
+        nearby = []
+        if len(coordinates) >= 3:
+            current = tuple(float(value) for value in coordinates[-3:])
+            for landmark in observation["god_state"].get("landmarks", {}).values():
+                if not isinstance(landmark, dict) or str(landmark.get("dimension", "")).casefold() != current_dimension:
+                    continue
+                try:
+                    target = tuple(float(value) for value in str(landmark.get("position", "")).split())
+                except ValueError:
+                    continue
+                if len(target) != 3:
+                    continue
+                distance = round(math.dist(current, target), 1)
+                if distance <= 256:
+                    nearby.append({"id": landmark.get("id"), "name": landmark.get("name"), "distance": distance, "position": landmark.get("position")})
+        observation["nearby_landmarks"] = sorted(nearby, key=lambda item: item["distance"])[:8]
+        if include_scene:
+            try:
+                observation["scene"] = self.inspect_area()
+            except Exception as exc:
+                observation["scene"] = {"ok": False, "error": str(exc)}
+        else:
+            observation["scene"] = {"status": "not_requested", "hint": "Use inspect_area only when exact local geometry matters."}
         return observation
+
+    def recent_story_events(self, limit: int = 10) -> list[dict[str, Any]]:
+        audit_only = {"god_action", "player_snapshot", "block_place", "block_break", "mob_kill", "health_threshold"}
+        return [compact_event(event) for event in self.recent_events(50) if event.get("type") not in audit_only][-max(1, min(int(limit), 20)):]
 
     def read_chat(self, limit: int = 10) -> list[dict[str, Any]]:
         limit = _bounded_limit(limit)
@@ -682,9 +985,239 @@ class GodBridge:
             raise ValueError(f"unknown god state fields: {', '.join(sorted(unknown))}")
         with self._lock:
             self._god_state = self._load_state_from(self._state_path)
-            self._god_state.update(updates)
+            scalar_updates = dict(updates)
+            incoming_memories = scalar_updates.pop("memories", None)
+            incoming_landmarks = scalar_updates.pop("landmarks", None)
+            self._god_state.update(scalar_updates)
+            if incoming_memories is not None:
+                if not isinstance(incoming_memories, list):
+                    raise ValueError("memories must be an array")
+                memories = [str(item).strip() for item in self._god_state.get("memories", []) if str(item).strip()]
+                for item in incoming_memories:
+                    memory = str(item).strip()
+                    if memory and memory not in memories:
+                        memories.append(memory)
+                self._god_state["memories"] = memories[-MAX_MEMORIES:]
+            if incoming_landmarks is not None:
+                if not isinstance(incoming_landmarks, dict):
+                    raise ValueError("landmarks must be an object")
+                landmarks = dict(self._god_state.get("landmarks", {}))
+                landmarks.update(incoming_landmarks)
+                self._god_state["landmarks"] = dict(list(landmarks.items())[-MAX_LANDMARKS:])
             self._save_state()
             return self.get_god_state()
+
+    def remember_landmark(self, landmark: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(landmark, dict):
+            raise ValueError("landmark must be an object")
+        name = str(landmark.get("name", "")).strip()
+        key = landmark_key(str(landmark.get("id") or name))
+        position = str(landmark.get("position", "")).strip()
+        x, y, z = absolute_block_position(position)
+        dimension = normalize_dimension(str(landmark.get("dimension", "minecraft:overworld")))
+        aliases = landmark.get("aliases", [])
+        if not isinstance(aliases, list):
+            raise ValueError("landmark aliases must be an array")
+        clean: dict[str, Any] = {
+            "id": key,
+            "name": name or key.replace("_", " ").title(),
+            "dimension": dimension,
+            "position": f"{x} {y} {z}",
+            "aliases": list(dict.fromkeys(str(item).strip()[:64] for item in aliases if str(item).strip()))[:12],
+            "notes": str(landmark.get("notes", ""))[:1000],
+            "confidence": str(landmark.get("confidence", "verified"))[:32],
+            "visibility": str(landmark.get("visibility", "private"))[:32],
+            "last_verified_at": str(landmark.get("last_verified_at") or utc_now()),
+        }
+        bounds = landmark.get("bounds")
+        if bounds is not None and bounds != "":
+            if not isinstance(bounds, dict) or not {"min", "max"} <= set(bounds):
+                raise ValueError("landmark bounds must contain min and max coordinate strings")
+            min_pos = absolute_block_position(str(bounds["min"]))
+            max_pos = absolute_block_position(str(bounds["max"]))
+            clean["bounds"] = {
+                "min": " ".join(str(min(a, b)) for a, b in zip(min_pos, max_pos)),
+                "max": " ".join(str(max(a, b)) for a, b in zip(min_pos, max_pos)),
+            }
+        with self._lock:
+            self._god_state = self._load_state_from(self._state_path)
+            landmarks = dict(self._god_state.get("landmarks", {}))
+            existing = landmarks.get(key, {}) if isinstance(landmarks.get(key), dict) else {}
+            existing.update(clean)
+            landmarks[key] = existing
+            self._god_state["landmarks"] = dict(list(landmarks.items())[-MAX_LANDMARKS:])
+            self._save_state()
+        return {"ok": True, "landmark": existing, "landmark_count": len(self._god_state["landmarks"])}
+
+    def list_landmarks(self, query: str = "") -> dict[str, Any]:
+        state = self.get_god_state()
+        landmarks = list(state.get("landmarks", {}).values())
+        query = str(query or "").strip().casefold()
+        if query:
+            landmarks = [item for item in landmarks if query in " ".join([
+                str(item.get("id", "")), str(item.get("name", "")),
+                " ".join(str(alias) for alias in item.get("aliases", [])),
+                str(item.get("notes", "")),
+            ]).casefold()]
+        return {"ok": True, "landmarks": landmarks, "count": len(landmarks)}
+
+    def forget_landmark(self, landmark_id: str) -> dict[str, Any]:
+        key = landmark_key(landmark_id)
+        with self._lock:
+            self._god_state = self._load_state_from(self._state_path)
+            landmarks = dict(self._god_state.get("landmarks", {}))
+            removed = landmarks.pop(key, None)
+            self._god_state["landmarks"] = landmarks
+            self._save_state()
+        return {"ok": True, "removed": bool(removed), "landmark_id": key}
+
+    def observe_location(
+        self,
+        landmark_id: str,
+        radius: int = 12,
+        vertical_radius: int = 8,
+        include_scene: bool = True,
+    ) -> dict[str, Any]:
+        matches = self.list_landmarks(landmark_id)["landmarks"]
+        exact = [item for item in matches if item.get("id") == landmark_key(landmark_id)]
+        if exact:
+            landmark = exact[0]
+        elif len(matches) == 1:
+            landmark = matches[0]
+        else:
+            raise ValueError(f"landmark '{landmark_id}' is unknown or ambiguous")
+        result: dict[str, Any] = {"ok": True, "landmark": landmark, "observed_at": utc_now()}
+        if include_scene:
+            scene = self.inspect_area_at(landmark["position"], landmark["dimension"], radius, vertical_radius)
+            result["ok"] = bool(scene.get("ok"))
+            result["scene"] = scene
+        return result
+
+    def set_story_objective(self, objective: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(objective, dict):
+            raise ValueError("objective must be an object")
+        description = str(objective.get("description", "")).strip()
+        watch = objective.get("watch")
+        if not description or not isinstance(watch, dict):
+            raise ValueError("objective requires a description and deterministic watch")
+        objective_id = landmark_key(str(objective.get("id") or f"objective_{int(time.time())}"))
+        watch = dict(watch)
+        watch.setdefault("description", description)
+        watch["objective_id"] = objective_id
+        registered = self.register_story_watch(watch)
+        clean = {
+            "id": objective_id,
+            "description": description,
+            "status": "active",
+            "created_at": utc_now(),
+            "watch_id": registered["watch"]["id"],
+            "landmark_id": str(objective.get("landmark_id", ""))[:64],
+            "completion_note": str(objective.get("completion_note", ""))[:500],
+        }
+        with self._lock:
+            self._god_state = self._load_state_from(self._state_path)
+            objectives = [item for item in self._god_state.get("story_objectives", []) if isinstance(item, dict) and item.get("id") != objective_id]
+            objectives.append(clean)
+            self._god_state["story_objectives"] = objectives[-MAX_OBJECTIVES:]
+            promises = [str(item) for item in self._god_state.get("unresolved_promises", []) if str(item)]
+            if description not in promises:
+                promises.append(description)
+            self._god_state["unresolved_promises"] = promises[-MAX_OBJECTIVES:]
+            self._save_state()
+        return {"ok": True, "objective": clean, "watch": registered["watch"]}
+
+    def complete_story_objective(self, objective_id: str, outcome: str = "fulfilled") -> dict[str, Any]:
+        key = landmark_key(objective_id)
+        outcome = str(outcome or "fulfilled").strip().casefold()
+        if outcome not in {"fulfilled", "failed", "abandoned"}:
+            raise ValueError("outcome must be fulfilled, failed, or abandoned")
+        with self._lock:
+            self._god_state = self._load_state_from(self._state_path)
+            objective = next((item for item in self._god_state.get("story_objectives", []) if isinstance(item, dict) and item.get("id") == key), None)
+            if not objective:
+                raise ValueError(f"unknown story objective: {objective_id}")
+            objective["status"] = outcome
+            objective["resolved_at"] = utc_now()
+            description = str(objective.get("description", ""))
+            self._god_state["unresolved_promises"] = [item for item in self._god_state.get("unresolved_promises", []) if item != description]
+            watch_id = str(objective.get("watch_id", ""))
+            self._god_state["story_watches"] = [item for item in self._god_state.get("story_watches", []) if not isinstance(item, dict) or item.get("id") != watch_id]
+            self._save_state()
+        return {"ok": True, "objective": objective}
+
+    def _turn_context(self) -> dict[str, Any]:
+        path = Path(self.config.turn_context_file)
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _speech_guard(self, message: str) -> tuple[dict[str, Any], str]:
+        context = self._turn_context()
+        turn_id = str(context.get("turn_id", ""))
+        state = self.get_god_state()
+        if turn_id and state.get("last_spoken_turn_id") == turn_id:
+            raise PermissionError("only one player-visible message is allowed in a God turn")
+        previous = state.get("last_player_visible_message")
+        if isinstance(previous, dict):
+            old_text = re.sub(r"\s+", " ", str(previous.get("text", "")).casefold()).strip()
+            new_text = re.sub(r"\s+", " ", message.casefold()).strip()
+            sent_at = _parse_epoch(previous.get("at_epoch"))
+            if old_text and old_text == new_text and sent_at is not None and time.time() - sent_at < self.config.repeated_speech_cooldown:
+                raise PermissionError("a substantially identical player-visible message was sent recently")
+        return state, turn_id
+
+    def _remember_speech(self, state: dict[str, Any], turn_id: str, message: str) -> None:
+        state["last_player_visible_message"] = {"text": message.strip(), "at": utc_now(), "at_epoch": _epoch_string(time.time())}
+        if turn_id:
+            state["last_spoken_turn_id"] = turn_id
+        with self._lock:
+            self._god_state = self._load_state_from(self._state_path)
+            self._god_state.update({
+                "last_player_visible_message": state["last_player_visible_message"],
+                "last_spoken_turn_id": state.get("last_spoken_turn_id", ""),
+            })
+            self._save_state()
+
+    def register_story_watch(self, watch: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(watch, dict):
+            raise ValueError("watch must be an object")
+        kind = str(watch.get("kind", "event")).casefold()
+        if kind not in WATCH_KINDS:
+            raise ValueError(f"watch kind must be one of: {', '.join(sorted(WATCH_KINDS))}")
+        clean = dict(watch)
+        clean["kind"] = kind
+        if kind in {"all", "any"}:
+            conditions = clean.get("conditions")
+            if not isinstance(conditions, list) or not 2 <= len(conditions) <= 8:
+                raise ValueError("composite watches require 2 to 8 conditions")
+            for condition in conditions:
+                if not isinstance(condition, dict) or str(condition.get("kind", "event")).casefold() not in WATCH_KINDS - {"all", "any"}:
+                    raise ValueError("composite watch conditions must be supported non-composite watches")
+        clean["id"] = str(clean.get("id") or f"watch-{int(time.time())}-{len(self.get_god_state().get('story_watches', [])) + 1}")[:128]
+        clean["created_at"] = utc_now()
+        if not clean.get("description"):
+            raise ValueError("watch description is required")
+        with self._lock:
+            self._god_state = self._load_state_from(self._state_path)
+            watches = [item for item in self._god_state.get("story_watches", []) if isinstance(item, dict) and item.get("id") != clean["id"]]
+            watches.append(clean)
+            self._god_state["story_watches"] = watches[-20:]
+            self._save_state()
+        return {"ok": True, "watch": clean, "watch_count": len(watches[-20:])}
+
+    def clear_story_watch(self, watch_id: str) -> dict[str, Any]:
+        watch_id = str(watch_id or "").strip()
+        if not watch_id:
+            raise ValueError("watch_id is required")
+        with self._lock:
+            self._god_state = self._load_state_from(self._state_path)
+            previous = self._god_state.get("story_watches", [])
+            watches = [item for item in previous if not isinstance(item, dict) or item.get("id") != watch_id]
+            self._god_state["story_watches"] = watches
+            self._save_state()
+        return {"ok": True, "watch_id": watch_id, "removed": len(previous) - len(watches)}
 
     def god_say(self, message: str) -> dict[str, Any]:
         """Backward-compatible private speech to this god's own player."""
@@ -696,6 +1229,7 @@ class GodBridge:
             raise ValueError("message must be a non-empty string")
         if len(message) > 256:
             raise ValueError("god message cannot exceed 256 characters")
+        state, turn_id = self._speech_guard(message)
         speaker = f"[God of {self.current_player_name()}] "
         component = [
             {"text": speaker, "color": "dark_purple", "bold": True},
@@ -703,6 +1237,8 @@ class GodBridge:
         ]
         tellraw = f"tellraw @a {json.dumps(component, separators=(',', ':'))}"
         result = self.execute(tellraw, allow_shared=True)
+        if result.get("ok"):
+            self._remember_speech(state, turn_id, message)
         result.update({"message": message, "speaker": speaker, "public": True})
         return result
 
@@ -712,19 +1248,36 @@ class GodBridge:
             raise ValueError("message must be a non-empty string")
         if len(message) > 256:
             raise ValueError("god message cannot exceed 256 characters")
+        state, turn_id = self._speech_guard(message)
         player = self.current_player_name()
         tellraw = f"tellraw {player} {{\"text\":{json.dumps(message)},\"color\":\"dark_purple\",\"bold\":true}}"
         result = self._execute_targeted(tellraw, owner_id)
+        if result.get("ok"):
+            self._remember_speech(state, turn_id, message)
         result.update({"message": message, "player": player, "private": True})
         return result
 
-    def send_god_message(self, target: str, message: str, *, subject: str = "", event_id: int | None = None) -> dict[str, Any]:
+    def send_god_message(
+        self,
+        target: str,
+        message: str,
+        *,
+        subject: str = "",
+        event_id: int | None = None,
+        message_type: str = "intent",
+        verified: bool = False,
+    ) -> dict[str, Any]:
         owner_id = self._require_owner()
         target_profile = self._resolve_player(target)
         if target_profile["player_id"] == owner_id:
             raise ValueError("use whisper_player to speak to your own player")
         if not isinstance(message, str) or not message.strip() or len(message) > 1000:
             raise ValueError("message must be between 1 and 1000 characters")
+        message_type = str(message_type or "intent").strip().casefold()
+        if message_type not in MESSAGE_TYPES:
+            raise ValueError(f"message_type must be one of: {', '.join(sorted(MESSAGE_TYPES))}")
+        if message_type == "verified_fact" and not verified:
+            raise ValueError("verified_fact messages must set verified=true")
         interaction = self._ledger.add_interaction(
             kind="god_message",
             from_player_id=owner_id,
@@ -733,19 +1286,38 @@ class GodBridge:
             message=message.strip(),
             reason=subject.strip()[:256],
             event_id=event_id,
+            payload={
+                "message_type": message_type,
+                "verified": bool(verified),
+                "resolved_reference": target_profile.get("resolved_reference", target),
+            },
         )
         self.record_event({
             "type": "god_message",
+            "source": "god",
+            "wake_policy": "recipient",
             "from_player_id": owner_id,
             "from_player": self.current_player_name(),
             "to_player_id": target_profile["player_id"],
             "to_player": target_profile["name"],
             "message": message.strip(),
             "subject": subject.strip()[:256],
+            "message_type": message_type,
+            "verified": bool(verified),
             "interaction_id": interaction["id"],
             "source_event_id": event_id,
         })
-        return {"ok": True, "interaction": interaction}
+        return {
+            "ok": True,
+            "delivery": {
+                "status": "delivered",
+                "target_player_id": target_profile["player_id"],
+                "target_player": target_profile["name"],
+                "matched_reference": target_profile.get("resolved_reference", target),
+                "match_method": target_profile.get("match_method", "canonical_id_or_alias"),
+            },
+            "interaction": interaction,
+        }
 
     def list_interventions(self, limit: int = 20) -> list[dict[str, Any]]:
         owner_id = self._require_owner()
@@ -770,6 +1342,8 @@ class GodBridge:
         )
         self.record_event({
             "type": "intervention_request",
+            "source": "god",
+            "wake_policy": "recipient",
             "interaction_id": interaction["id"],
             "from_player_id": owner_id,
             "from_player": self.current_player_name(),
@@ -786,6 +1360,8 @@ class GodBridge:
         result = self._ledger.respond(request_id, owner_id, decision, str(note)[:1000])
         self.record_event({
             "type": "intervention_response",
+            "source": "god",
+            "wake_policy": "requester",
             "interaction_id": request_id,
             "from_player_id": owner_id,
             "to_player_id": result["from_player_id"],
@@ -803,6 +1379,8 @@ class GodBridge:
         result.update({"action": "approved_smite", "request_id": request_id, "target": target["name"]})
         self.record_event({
             "type": "intervention_used",
+            "source": "god",
+            "wake_policy": "never",
             "interaction_id": request_id,
             "player_uuid": owner_id,
             "target_player_id": target["player_id"],
@@ -828,9 +1406,9 @@ class GodBridge:
                 self._save_state()
         return result
 
-    def action(self, name: str, command_builder: Callable[[], str]) -> dict[str, Any]:
+    def action(self, name: str, command_builder: Callable[[], str], *, idempotency_key: str = "") -> dict[str, Any]:
         command = command_builder()
-        result = self.execute(command)
+        result = self.execute(command, idempotency_key=idempotency_key)
         result["action"] = name
         return result
 
@@ -860,16 +1438,27 @@ class GodBridge:
         result["ok"] = bool(result.get("ok") and enable.get("ok") and reload_result.get("ok"))
         return result
 
-    def place_structure(self, structure: str, position: str, rotation: str = "none") -> dict[str, Any]:
+    def place_structure(
+        self,
+        structure: str,
+        position: str,
+        rotation: str = "none",
+        preview: bool = False,
+        idempotency_key: str = "",
+        dimension: str = "",
+    ) -> dict[str, Any]:
         if rotation not in {"none", "clockwise_90", "clockwise_180", "counterclockwise_90"}:
             raise ValueError("invalid structure rotation")
         entry = self.structure_library().get(structure)
-        if self.config.dry_run and "~" in position:
+        if dimension:
+            dimension = normalize_dimension(dimension)
+            block_position = absolute_block_position(position)
+        elif self.config.dry_run and "~" in position:
             block_position = (0, 0, 0)
         else:
             block_position = self.resolve_block_position(position)
         size = entry.get("size", []) if entry else []
-        preflight = self._structure_preflight(block_position, size) if size and not self.config.dry_run else {"ok": None, "status": "not-run"}
+        preflight = self._structure_preflight(block_position, size, dimension) if size and not self.config.dry_run else {"ok": None, "status": "not-run"}
         if preflight.get("ok") is False:
             return {
                 "ok": False,
@@ -881,9 +1470,23 @@ class GodBridge:
             }
         command_position = parse_position(position)
         command = f"place template {structure} {command_position} {rotation}"
-        if "~" in command_position:
+        if dimension:
+            command = f"execute in {dimension} run {command}"
+        elif "~" in command_position:
             command = self.command_at_player(command)
-        result = self.action("place_structure", lambda: command)
+        if preview:
+            return {
+                "ok": True,
+                "action": "place_structure_preview",
+                "preview": True,
+                "structure": structure,
+                "origin": None if self.config.dry_run and "~" in position else {"x": block_position[0], "y": block_position[1], "z": block_position[2]},
+                "rotation": rotation,
+                "command": command,
+                "preflight": preflight,
+                "verification": {"ok": None, "status": "not-mutated"},
+            }
+        result = self.action("place_structure", lambda: command, idempotency_key=idempotency_key)
         result["structure"] = structure
         result["origin"] = None if self.config.dry_run and "~" in position else {"x": block_position[0], "y": block_position[1], "z": block_position[2]}
         result["preflight"] = preflight
@@ -902,14 +1505,15 @@ class GodBridge:
                 continue
             rotated = _rotate_structure_position(raw_pos, size, rotation)
             target = tuple(block_position[index] + rotated[index] for index in range(3))
-            check = self.execute(f"data get block {target[0]} {target[1]} {target[2]}", record=False)
-            samples.append({"position": target, "expected": block_name, "result": check, "matched": block_name in check.get("output", "")})
+            check = self.inspect_block(f"{target[0]} {target[1]} {target[2]}", dimension)
+            actual = str(check.get("block", {}).get("type", ""))
+            samples.append({"position": target, "expected": block_name, "result": check, "matched": actual == block_name})
         result["size"] = size
         result["verification"] = {"ok": bool(samples) and all(item["matched"] for item in samples), "samples": samples}
         result["ok"] = bool(result["ok"] and result["verification"]["ok"])
         return result
 
-    def _structure_preflight(self, origin: tuple[int, int, int], size: list[Any]) -> dict[str, Any]:
+    def _structure_preflight(self, origin: tuple[int, int, int], size: list[Any], dimension: str = "") -> dict[str, Any]:
         """Check representative footprint/clearance points before mutating terrain."""
         if len(size) < 3:
             return {"ok": None, "status": "insufficient-metadata"}
@@ -927,7 +1531,7 @@ class GodBridge:
         }
         checks: list[dict[str, Any]] = []
         for point in sorted(points):
-            inspected = self.inspect_block(f"{point[0]} {point[1]} {point[2]}")
+            inspected = self.inspect_block(f"{point[0]} {point[1]} {point[2]}", dimension)
             checks.append({"position": point, "result": inspected})
             if not inspected.get("ok"):
                 return {"ok": False, "reason": "exact block inspection failed", "checks": checks}

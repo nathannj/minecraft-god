@@ -22,12 +22,17 @@ $env:MINECRAFT_EVENTS_FILE = Join-Path $Root "state\events.jsonl"
 $env:MINECRAFT_LEDGER_FILE = Join-Path $Root "state\god_ledger.sqlite3"
 $env:MINECRAFT_PROFILE_DIR = Join-Path $Root "state\players"
 $env:MINECRAFT_MAX_GODS = "32"
+$env:MINECRAFT_GOD_IDLE_SECONDS = "120"
+$env:MINECRAFT_GOD_STORY_INTERVAL_SECONDS = "180"
+$env:MINECRAFT_GOD_MAX_THREAD_TURNS = "12"
+$env:MINECRAFT_GOD_LOG_MAX_BYTES = "26214400"
 $env:MINECRAFT_EVENT_BASE_URL = "http://127.0.0.1:8765"
 $npmCodex = Join-Path $env:APPDATA "npm\codex.cmd"
 if (Test-Path $npmCodex) { $env:CODEX_CLI_PATH = $npmCodex }
 $readyFile = Join-Path $Root "logs\god-controller.ready"
 Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue
 $env:MINECRAFT_GOD_READY_FILE = $readyFile
+$env:MINECRAFT_GOD_CONTROLLER_LOCK_FILE = Join-Path $Root "logs\god-controller.lock"
 
 $hubOut = Join-Path $Root "logs\event-hub.out.log"
 $hubErr = Join-Path $Root "logs\event-hub.err.log"

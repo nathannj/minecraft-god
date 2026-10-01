@@ -13,6 +13,14 @@ commands:
     description: Return exact block properties at a coordinate for the Minecraft God.
     usage: /godcheck <player> <x> <y> <z>
     permission: minecraftgod.scan
+  godscanat:
+    description: Return an exact scene around a remote coordinate without moving a player.
+    usage: /godscanat <dimension> <x> <y> <z> [radius] [vertical-radius]
+    permission: minecraftgod.scan
+  godcheckat:
+    description: Return exact block properties in a named dimension.
+    usage: /godcheckat <dimension> <x> <y> <z>
+    permission: minecraftgod.scan
   pray:
     description: Speak privately to your personal god.
     usage: /pray <message>

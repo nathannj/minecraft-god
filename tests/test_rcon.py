@@ -63,3 +63,40 @@ def test_command_assembles_paper_multi_packet_responses(monkeypatch):
 
     assert len(response.body) > 4096
     assert response.body.endswith('{"complete":true}')
+
+
+def test_command_keeps_response_when_paper_omits_empty_sentinel(monkeypatch):
+    class FakeSocket:
+        def __init__(self):
+            self.pending = bytearray()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def sendall(self, packet):
+            request_id = struct.unpack("<i", packet[4:8])[0]
+            packet_type = struct.unpack("<i", packet[8:12])[0]
+            if packet_type == rcon.SERVERDATA_AUTH:
+                self.pending.extend(rcon.encode_packet(request_id, rcon.SERVERDATA_AUTH, ""))
+            elif packet[12:-2].decode("utf-8") != "list":
+                self.pending.extend(rcon.encode_packet(request_id, rcon.SERVERDATA_RESPONSE_VALUE, "There are 0 players online"))
+
+        def recv(self, size):
+            if not self.pending:
+                return b""
+            chunk = bytes(self.pending[:size])
+            del self.pending[:size]
+            return chunk
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(rcon.socket, "create_connection", lambda address, timeout: fake_socket)
+
+    response = rcon.RconClient("127.0.0.1", 25575, "password").command("time query daytime")
+
+    assert response.body == "There are 0 players online"

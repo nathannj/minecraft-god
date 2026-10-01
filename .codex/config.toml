@@ -1,0 +1,10 @@
+[mcp_servers.minecraft_god]
+command = 'C:\Windows\py.exe'
+args = ["-3", 'E:\MinecraftAiGod\run_bridge.py', "--no-events"]
+
+[mcp_servers.minecraft_god.env]
+MINECRAFT_RCON_PASSWORD_FILE = 'E:\MinecraftAiGod\server\rcon-password.txt'
+MINECRAFT_EVENTS_FILE = 'E:\MinecraftAiGod\state\events.jsonl'
+MINECRAFT_LEDGER_FILE = 'E:\MinecraftAiGod\state\god_ledger.sqlite3'
+MINECRAFT_PROFILE_DIR = 'E:\MinecraftAiGod\state\players'
+MINECRAFT_REQUIRE_GOD_SCOPE = "true"

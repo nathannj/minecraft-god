@@ -152,15 +152,15 @@ Copy-Item -LiteralPath $pluginJar.FullName -Destination (Join-Path $pluginsDir "
 
 $codex = Get-Command codex -CommandType Application -ErrorAction SilentlyContinue
 if (-not $codex) { throw "Codex CLI was not found. Install/sign in to Codex, then run setup again." }
-Write-Host "Registering the Minecraft God MCP server with Codex..."
+# Keep the bridge scoped to this project/controller. A global registration
+# makes every unrelated Codex task start the Minecraft MCP server and can
+# destabilize the desktop AppServer when the game is offline.
+if (-not (Test-Path (Join-Path $Root ".codex\config.toml"))) {
+    throw "The project-scoped Codex MCP config is missing: .codex\config.toml"
+}
+Write-Host "Removing any legacy global Minecraft God MCP registration..."
 & codex mcp remove minecraft_god 2>$null
-& codex mcp add minecraft_god `
-    --env "MINECRAFT_RCON_PASSWORD_FILE=$passwordFile" `
-    --env "MINECRAFT_EVENTS_FILE=$(Join-Path $Root 'state\events.jsonl')" `
-    --env "MINECRAFT_LEDGER_FILE=$(Join-Path $Root 'state\god_ledger.sqlite3')" `
-    --env "MINECRAFT_PROFILE_DIR=$(Join-Path $Root 'state\players')" `
-    --env "MINECRAFT_REQUIRE_GOD_SCOPE=true" `
-    -- (Get-Command py).Source -3 (Join-Path $Root "run_bridge.py") --no-events
+Write-Host "Minecraft God MCP is scoped to E:\MinecraftAiGod and the dedicated controller."
 
 if (-not $AcceptEula) {
     Write-Host "`nSetup is complete, but the Minecraft EULA is not accepted yet."

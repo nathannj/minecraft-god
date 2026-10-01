@@ -2,7 +2,7 @@ import json
 
 from collections import deque
 
-from god_bridge.controller import CodexAppServer, Transcript, _event_for_turn, _event_targets, turn_text
+from god_bridge.controller import ControllerAlreadyRunning, ControllerLock, CodexAppServer, Transcript, _event_for_turn, _event_targets, turn_text
 
 
 def test_transcript_writes_readable_and_jsonl_logs(tmp_path):
@@ -39,7 +39,9 @@ def test_app_server_command_overrides_mcp_scope():
         "MINECRAFT_GOD_PLAYER_ID": "alice-id",
         "MINECRAFT_GOD_PLAYER": "Alice",
         "MINECRAFT_REQUIRE_GOD_SCOPE": "true",
-    })
+    }, r"E:\MinecraftAiGod")
+    assert any(item.startswith("mcp_servers.minecraft_god.command=") for item in command)
+    assert any("mcp_servers.minecraft_god.args=" in item and "run_bridge.py" in item for item in command)
     assert "mcp_servers.minecraft_god.env.MINECRAFT_GOD_PLAYER_ID='alice-id'" in command
     assert "mcp_servers.minecraft_god.env.MINECRAFT_GOD_PLAYER='Alice'" in command
     assert "mcp_servers.minecraft_god.env.MINECRAFT_REQUIRE_GOD_SCOPE='true'" in command
@@ -80,3 +82,22 @@ def test_turn_text_contains_player_ownership_context():
     text = turn_text(None, player_name="Alice", player_id="alice-id")
     assert "personal god of Alice" in text
     assert "directly affect only that player" in text
+
+
+def test_controller_lock_allows_only_one_owner(tmp_path):
+    lock_path = tmp_path / "god-controller.lock"
+    first = ControllerLock(lock_path)
+    second = ControllerLock(lock_path)
+    first.acquire()
+    try:
+        assert lock_path.read_text(encoding="ascii")
+        try:
+            second.acquire()
+        except ControllerAlreadyRunning:
+            pass
+        else:
+            raise AssertionError("a second controller acquired the lock")
+    finally:
+        first.release()
+    second.acquire()
+    second.release()

@@ -3,7 +3,9 @@ package com.minecraftgod.bridge;
 import io.papermc.paper.event.player.AsyncChatEvent;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
+import org.bukkit.Chunk;
 import org.bukkit.Location;
+import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.Sign;
@@ -16,6 +18,11 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityDeathEvent;
+import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerAdvancementDoneEvent;
@@ -23,6 +30,7 @@ import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.inventory.ItemStack;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -34,6 +42,8 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /** Emits compact, story-relevant signals to the local bridge. */
@@ -44,6 +54,8 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
     private String bridgeUrl;
     private String bridgeToken;
     private String playerName;
+    private final Map<UUID, String> lastSnapshot = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> lastHealthBand = new ConcurrentHashMap<>();
 
     @Override
     public void onEnable() {
@@ -52,11 +64,20 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         bridgeToken = getConfig().getString("bridge-token", "");
         playerName = getConfig().getString("player-name", "");
         Bukkit.getPluginManager().registerEvents(this, this);
+        // Cheap deterministic telemetry supports story watches without waking
+        // an LLM.  A snapshot is emitted only when its contents have changed.
+        Bukkit.getScheduler().runTaskTimer(this, this::emitChangedSnapshots, 100L, 300L);
         if (getCommand("godscan") != null) {
             getCommand("godscan").setExecutor(this);
         }
         if (getCommand("godcheck") != null) {
             getCommand("godcheck").setExecutor(this);
+        }
+        if (getCommand("godscanat") != null) {
+            getCommand("godscanat").setExecutor(this);
+        }
+        if (getCommand("godcheckat") != null) {
+            getCommand("godcheckat").setExecutor(this);
         }
 
         getLogger().info("Minecraft God bridge enabled: " + bridgeUrl);
@@ -146,6 +167,109 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         }
     }
 
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBlockPlace(BlockPlaceEvent event) {
+        Player player = event.getPlayer();
+        sendEvent(event("block_place", Map.of(
+                "player", player.getName(),
+                "player_uuid", player.getUniqueId().toString(),
+                "block", event.getBlockPlaced().getType().getKey().toString(),
+                "position", position(event.getBlockPlaced().getLocation()),
+                "wake_policy", "never"
+        )));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBlockBreak(BlockBreakEvent event) {
+        Player player = event.getPlayer();
+        sendEvent(event("block_break", Map.of(
+                "player", player.getName(),
+                "player_uuid", player.getUniqueId().toString(),
+                "block", event.getBlock().getType().getKey().toString(),
+                "position", position(event.getBlock().getLocation()),
+                "wake_policy", "never"
+        )));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onItemPickup(EntityPickupItemEvent event) {
+        if (!(event.getEntity() instanceof Player player)) {
+            return;
+        }
+        ItemStack stack = event.getItem().getItemStack();
+        sendEvent(event("item_acquired", Map.of(
+                "player", player.getName(),
+                "player_uuid", player.getUniqueId().toString(),
+                "item", stack.getType().getKey().toString(),
+                "amount", stack.getAmount(),
+                "wake_policy", "never"
+        )));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onEntityDeath(EntityDeathEvent event) {
+        if (event.getEntity() instanceof Player) {
+            return;
+        }
+        Player killer = event.getEntity().getKiller();
+        if (killer == null) {
+            return;
+        }
+        sendEvent(event("mob_kill", Map.of(
+                "player", killer.getName(),
+                "player_uuid", killer.getUniqueId().toString(),
+                "entity", event.getEntityType().getKey().toString(),
+                "position", position(event.getEntity().getLocation()),
+                "wake_policy", "never"
+        )));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onDamage(EntityDamageEvent event) {
+        if (!(event.getEntity() instanceof Player player)) {
+            return;
+        }
+        double health = Math.max(0.0, player.getHealth() - event.getFinalDamage());
+        int band = health <= 2.0 ? 1 : health <= 6.0 ? 2 : health <= 10.0 ? 3 : 4;
+        Integer previous = lastHealthBand.put(player.getUniqueId(), band);
+        if (band >= 4 || (previous != null && previous == band)) {
+            return;
+        }
+        sendEvent(event("health_threshold", Map.of(
+                "player", player.getName(),
+                "player_uuid", player.getUniqueId().toString(),
+                "health", Math.round(health * 10.0) / 10.0,
+                "cause", event.getCause().name().toLowerCase(),
+                "wake_policy", health <= 6.0 ? "always" : "accumulate"
+        )));
+    }
+
+    private void emitChangedSnapshots() {
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            Map<String, Integer> inventory = new LinkedHashMap<>();
+            for (ItemStack stack : player.getInventory().getContents()) {
+                if (stack == null || stack.getType().isAir()) {
+                    continue;
+                }
+                inventory.merge(stack.getType().getKey().toString(), stack.getAmount(), Integer::sum);
+            }
+            Map<String, Object> snapshot = new LinkedHashMap<>();
+            snapshot.put("player", player.getName());
+            snapshot.put("player_uuid", player.getUniqueId().toString());
+            snapshot.put("dimension", player.getWorld().getKey().toString());
+            snapshot.put("position", position(player.getLocation()));
+            snapshot.put("health", Math.round(player.getHealth() * 10.0) / 10.0);
+            snapshot.put("inventory", inventory);
+            snapshot.put("wake_policy", "never");
+            String signature = toJson(snapshot);
+            if (!signature.equals(lastSnapshot.put(player.getUniqueId(), signature))) {
+                sendEvent(event("player_snapshot", snapshot));
+            }
+            int band = player.getHealth() <= 2.0 ? 1 : player.getHealth() <= 6.0 ? 2 : player.getHealth() <= 10.0 ? 3 : 4;
+            lastHealthBand.put(player.getUniqueId(), band);
+        }
+    }
+
     /**
      * Returns an exact, compact local scene description for the god's sight.
      * RCON invokes this as: godscan <player> [radius] [vertical-radius].
@@ -166,6 +290,12 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         }
         if (command.getName().equalsIgnoreCase("godcheck")) {
             return godcheck(sender, args);
+        }
+        if (command.getName().equalsIgnoreCase("godcheckat")) {
+            return godcheckat(sender, args);
+        }
+        if (command.getName().equalsIgnoreCase("godscanat")) {
+            return godscanat(sender, args);
         }
         if (!command.getName().equalsIgnoreCase("godscan")) {
             return false;
@@ -242,26 +372,132 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         return true;
     }
 
+    private boolean godcheckat(CommandSender sender, String[] args) {
+        if (args.length < 4) {
+            sender.sendMessage("{\"error\":\"usage: godcheckat <dimension> <x> <y> <z>\"}");
+            return true;
+        }
+        World world = worldFor(args[0]);
+        if (world == null) {
+            sender.sendMessage("{\"error\":\"dimension_not_found\",\"dimension\":\"" + escape(args[0]) + "\"}");
+            return true;
+        }
+        try {
+            int x = Integer.parseInt(args[1]);
+            int y = Integer.parseInt(args[2]);
+            int z = Integer.parseInt(args[3]);
+            Chunk chunk = world.getChunkAt(x >> 4, z >> 4);
+            chunk.addPluginChunkTicket(this);
+            try {
+                Block block = world.getBlockAt(x, y, z);
+                sender.sendMessage(toJson(blockDescription(world, block, x, y, z)));
+            } finally {
+                chunk.removePluginChunkTicket(this);
+            }
+        } catch (NumberFormatException exception) {
+            sender.sendMessage("{\"error\":\"coordinates_must_be_integers\"}");
+        }
+        return true;
+    }
+
+    private boolean godscanat(CommandSender sender, String[] args) {
+        if (args.length < 4) {
+            sender.sendMessage("{\"error\":\"usage: godscanat <dimension> <x> <y> <z> [radius] [vertical-radius]\"}");
+            return true;
+        }
+        World world = worldFor(args[0]);
+        if (world == null) {
+            sender.sendMessage("{\"error\":\"dimension_not_found\",\"dimension\":\"" + escape(args[0]) + "\"}");
+            return true;
+        }
+        try {
+            int x = Integer.parseInt(args[1]);
+            int y = Integer.parseInt(args[2]);
+            int z = Integer.parseInt(args[3]);
+            int radius = boundedArg(args, 4, 8, 1, 24);
+            int vertical = boundedArg(args, 5, 5, 1, 16);
+            Location location = new Location(world, x + 0.5, y, z + 0.5);
+            List<Chunk> tickets = scanChunkTickets(world, x, z, radius);
+            try {
+                sender.sendMessage(toJson(sceneScan(world, location, null, radius, vertical)));
+            } finally {
+                for (Chunk chunk : tickets) {
+                    chunk.removePluginChunkTicket(this);
+                }
+            }
+        } catch (NumberFormatException exception) {
+            sender.sendMessage("{\"error\":\"coordinates_must_be_integers\"}");
+        }
+        return true;
+    }
+
+    private World worldFor(String dimension) {
+        NamespacedKey key = NamespacedKey.fromString(dimension);
+        if (key != null) {
+            World keyed = Bukkit.getWorld(key);
+            if (keyed != null) {
+                return keyed;
+            }
+        }
+        return switch (dimension.toLowerCase()) {
+            case "minecraft:overworld", "overworld" -> Bukkit.getWorld("world");
+            case "minecraft:the_nether", "nether" -> Bukkit.getWorld("world_nether");
+            case "minecraft:the_end", "end" -> Bukkit.getWorld("world_the_end");
+            default -> Bukkit.getWorld(dimension);
+        };
+    }
+
+    private List<Chunk> scanChunkTickets(World world, int centerX, int centerZ, int radius) {
+        List<Chunk> chunks = new ArrayList<>();
+        int minChunkX = (centerX - radius) >> 4;
+        int maxChunkX = (centerX + radius) >> 4;
+        int minChunkZ = (centerZ - radius) >> 4;
+        int maxChunkZ = (centerZ + radius) >> 4;
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                Chunk chunk = world.getChunkAt(chunkX, chunkZ);
+                chunk.addPluginChunkTicket(this);
+                chunks.add(chunk);
+            }
+        }
+        return chunks;
+    }
+
+    private Map<String, Object> blockDescription(World world, Block block, int x, int y, int z) {
+        Map<String, Object> description = new LinkedHashMap<>();
+        description.put("dimension", world.getKey().toString());
+        description.put("position", x + " " + y + " " + z);
+        description.put("type", block.getType().getKey().toString());
+        description.put("solid", block.getType().isSolid());
+        description.put("passable", block.isPassable());
+        description.put("liquid", block.isLiquid());
+        description.put("replaceable", block.isReplaceable());
+        return description;
+    }
+
     private Map<String, Object> sceneScan(Player player, int radius, int vertical) {
-        Location location = player.getLocation();
-        World world = player.getWorld();
+        return sceneScan(player.getWorld(), player.getLocation(), player, radius, vertical);
+    }
+
+    private Map<String, Object> sceneScan(World world, Location location, Player player, int radius, int vertical) {
         int centerX = location.getBlockX();
         int centerY = location.getBlockY();
         int centerZ = location.getBlockZ();
         Map<String, Object> scan = new LinkedHashMap<>();
-        scan.put("player", player.getName());
+        scan.put("player", player == null ? "" : player.getName());
+        scan.put("remote", player == null);
         scan.put("dimension", world.getKey().toString());
         scan.put("position", position(location));
         scan.put("block_position", centerX + " " + centerY + " " + centerZ);
-        scan.put("eye_position", position(player.getEyeLocation()));
-        scan.put("yaw", round(player.getYaw()));
-        scan.put("pitch", round(player.getPitch()));
+        scan.put("eye_position", player == null ? position(location.clone().add(0, 1.62, 0)) : position(player.getEyeLocation()));
+        scan.put("yaw", player == null ? 0.0 : round(player.getYaw()));
+        scan.put("pitch", player == null ? 0.0 : round(player.getPitch()));
         scan.put("biome", location.getBlock().getBiome().getKey().toString());
         scan.put("time", world.getTime());
         scan.put("weather", world.isThundering() ? "thunder" : world.hasStorm() ? "rain" : "clear");
 
         List<Map<String, Object>> blocks = new ArrayList<>();
-        for (int y = centerY - vertical; y <= centerY + vertical; y++) {
+        for (int y = Math.max(world.getMinHeight(), centerY - vertical); y <= Math.min(world.getMaxHeight() - 1, centerY + vertical); y++) {
             for (int x = centerX - radius; x <= centerX + radius; x++) {
                 for (int z = centerZ - radius; z <= centerZ + radius; z++) {
                     Block block = world.getBlockAt(x, y, z);
@@ -284,7 +520,7 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         scan.put("blocks", blocks);
 
         List<Map<String, Object>> entities = new ArrayList<>();
-        for (Entity entity : player.getNearbyEntities(radius + 0.5, vertical + 3.0, radius + 0.5)) {
+        for (Entity entity : world.getNearbyEntities(location, radius + 0.5, vertical + 3.0, radius + 0.5)) {
             Location entityLocation = entity.getLocation();
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("uuid", entity.getUniqueId().toString());
@@ -344,6 +580,7 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
     private Map<String, Object> event(String type, Map<String, ?> data) {
         Map<String, Object> event = new HashMap<>();
         event.put("type", type);
+        event.put("source", "paper");
         event.putAll(data);
         return event;
     }

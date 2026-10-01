@@ -69,12 +69,13 @@ def test_imported_structure_placement_checks_a_representative_block(tmp_path: Pa
         def command(self, command):
             self.commands.append(command)
             if command.startswith("godcheck "):
+                block_type = "minecraft:stone" if command.endswith(" 11 22 33") else "minecraft:air"
                 return type("Response", (), {"body": json.dumps({
-                    "type": "minecraft:air",
-                    "solid": False,
-                    "passable": True,
+                    "type": block_type,
+                    "solid": block_type != "minecraft:air",
+                    "passable": block_type == "minecraft:air",
                     "liquid": False,
-                    "replaceable": True,
+                    "replaceable": block_type == "minecraft:air",
                 })})()
             body = "Block at 11 22 33 is minecraft:stone" if command.startswith("data get block") else "Successfully placed structure"
             return type("Response", (), {"body": body})()

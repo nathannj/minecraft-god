@@ -7,6 +7,7 @@
   "god_player_name": "",
   "profile_dir": "state/players",
   "active_player_file": "state/active_player.txt",
+  "turn_context_file": "state/turn_context.json",
   "event_host": "127.0.0.1",
   "event_port": 8765,
   "event_token": "",
@@ -23,5 +24,6 @@
   "structure_datapacks_dir": "server/world/datapacks",
   "structure_download_dir": "state/structure_downloads",
   "structure_max_download_mb": 64,
-  "minecraft_version": "26.2"
+  "minecraft_version": "26.2",
+  "repeated_speech_cooldown": 600
 }

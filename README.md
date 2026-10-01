@@ -7,15 +7,17 @@ This is the first playable bridge for **“I let an AI be GOD in my Minecraft wo
 - Dependency-free MCP JSON-RPC server over stdio.
 - RCON transport for Java Edition servers.
 - Persistent per-player god narrative state in `state/players/<uuid>/god_state.json`, with a shared SQLite pantheon ledger in `state/god_ledger.sqlite3`.
-- Tools for observation, exact local scene inspection, private visual scene capture, chat/events, arbitrary commands, speech, entities, safe entity-on-block placement, verified signs, items, weather, time, teleportation, effects, blocks, fills, structure search/import, and verified placement of Java structure templates.
+- Tools for player-centred and remote observation, exact block inspection, private visual scene capture, chat/events, arbitrary commands, speech, entities, safe entity-on-block placement, verified signs, items, weather, time, teleportation, effects, dimension-aware blocks and fills, structure search/import, and verified placement of Java structure templates.
 - `POST /events` intake for the Paper event plugin.
 - Dry-run mode and unit tests, so the agent loop can be exercised without Minecraft running.
-- A Paper plugin under `paper-plugin/` that emits UUID-tagged chat, lifecycle, death (including killer), advancement, and nearby explosion events.
+- A Paper plugin under `paper-plugin/` that emits UUID-tagged chat, lifecycle, death (including killer), advancement, nearby explosion, block, item, health, mob-kill, and changed snapshot signals.
 - A multi-god controller that creates one persistent Codex god/thread per joining player and routes each event only to the relevant god(s).
+- A deterministic story director that suppresses self-action echoes, accumulates low-salience events, coalesces bursts, and wakes the model only for direct, urgent, or active-story decisions.
+- Persistent landmarks, story phases, explicit objectives, and deterministic watches for events, regions, inventory goals, block actions, health thresholds, mob kills, deadlines, and composite conditions.
 - Private player whispers, god-to-god diplomacy, and expiring one-use intervention permissions.
 - Private player-to-god input through `/pray <message>` or `/whisper god <message>`; these do not appear as public chat messages.
 
-The bridge deliberately does not poll every game tick or emit a periodic snapshot heartbeat. The intended rhythm is an observation at the start of a scene, immediate event delivery for chat/interesting events, and long stretches where God may choose to do nothing. Location-sensitive actions re-observe the live world immediately before acting.
+The bridge deliberately does not invoke a model every game tick. The Paper plugin emits a changed snapshot at most every 15 seconds as cheap deterministic telemetry. Routine activity accumulates, but a sufficiently active online player now prompts an ambient "presence pulse" after two quiet minutes so the god can notice progress without being summoned; the model may still choose silence. Dangerously low health, direct address, urgent events, objectives, and registered watches wake it immediately. The intended rhythm is attentive and proactive without turning every block placement into speech. Location-sensitive actions re-observe the live world immediately before acting.
 
 ## One-time setup and launch on Windows
 
@@ -28,13 +30,15 @@ This is the intended path for the video:
 
 The launcher starts the event hub, then the Codex controller, then Paper. The controller deliberately ignores old events and waits for new `player_join` events. Every joining player gets a persistent personal god; reconnecting with the same UUID resumes that god's identity and state. `MINECRAFT_MAX_GODS` limits resource usage (32 by default).
 
-The setup downloads the latest stable Paper build for 26.2, installs and SHA-512 verifies the private `SpectatorCamera` Paper plugin, builds and installs the bridge plugin into the active server's `plugins` directory, downloads a private Java 25 runtime if necessary, generates a private RCON password, and registers the `minecraft_god` MCP server with the local Codex CLI. It may download a private Gradle copy into `.tools` if Gradle is not already installed.
+The setup downloads the latest stable Paper build for 26.2, installs and SHA-512 verifies the private `SpectatorCamera` Paper plugin, builds and installs the bridge plugin into the active server's `plugins` directory, downloads a private Java 25 runtime if necessary, generates a private RCON password, keeps the bridge project-scoped, and removes any legacy user-wide MCP registration. It may download a private Gradle copy into `.tools` if Gradle is not already installed.
 
 The launcher uses the npm-installed Codex CLI when available. This keeps the controller compatible with newer models such as `gpt-5.6-luna` even if the desktop-bundled CLI has not updated yet.
 
 Each dedicated God thread starts with `approvalPolicy = never` and full local access, and the controller automatically accepts approval requests from the `minecraft_god` MCP server. This is intentionally autonomous for this project; do not reuse these God threads for unrelated computer tasks.
 
 To reload the controller and its Codex god sessions without stopping Paper or disconnecting players, run `.\restart-god-controller.ps1` from this directory. It resumes profiles that the ledger still marks online and leaves the Minecraft server and event hub processes untouched.
+
+To shut down everything, double-click `stop-minecraft-god.cmd`. It asks Paper to save and stop cleanly, then forcibly removes any surviving project launcher, server, event hub, God controller, Codex God session, MCP bridge, or log watcher. It does not target unrelated Codex, Python, Java, or Minecraft processes. Running it again is safe and confirms that nothing remains.
 
 ## Track the live God session
 
@@ -45,6 +49,15 @@ Get-Content .\logs\god-session.log -Wait
 ```
 
 The detailed machine-readable transcript is [`logs/god-session.jsonl`](logs/god-session.jsonl). It records visible God messages, tool calls and results, Minecraft trigger events, and turn completion status. The Codex task is also named **Minecraft God - Live Session** in the Codex app. Private hidden chain-of-thought is not exposed; the transcript contains the observable reasoning/action surface instead.
+
+Transcripts are bounded to 64 KiB per record and rotate at 25 MiB. Rotated files remain in `logs` with timestamped names. Token-counter/status spam is not persisted. To produce a compact streaming report without loading a transcript into memory, run:
+
+```powershell
+.\summarize-god-session.ps1
+.\summarize-god-session.ps1 --all
+```
+
+`watch-god-session.cmd` automatically follows the active readable log across rotations.
 
 ## Run the bridge manually
 
@@ -82,22 +95,21 @@ Keep RCON bound to localhost. Do not expose it to the internet.
 
 ## Add it to Codex
 
-Register the bridge as a local stdio MCP server in the Codex MCP configuration. The exact file is installation-specific; the command entry is:
+The bridge is project-scoped in `.codex/config.toml`; do not register it in the user-wide Codex configuration. The setup script removes any legacy global registration. The controller also supplies per-player overrides when it launches each dedicated Codex AppServer.
 
 ```toml
 [mcp_servers.minecraft_god]
-command = "py"
-args = ["-3", "-m", "god_bridge.mcp_server"]
-cwd = "E:\\MinecraftAiGod"
+command = "C:\\Windows\\py.exe"
+args = ["-3", "E:\\MinecraftAiGod\\run_bridge.py", "--no-events"]
 
 [mcp_servers.minecraft_god.env]
-MINECRAFT_RCON_PASSWORD = "your-rcon-password"
+MINECRAFT_RCON_PASSWORD_FILE = "E:\\MinecraftAiGod\\server\\rcon-password.txt"
 MINECRAFT_EVENTS_FILE = "E:\\MinecraftAiGod\\state\\events.jsonl"
 MINECRAFT_LEDGER_FILE = "E:\\MinecraftAiGod\\state\\god_ledger.sqlite3"
 MINECRAFT_PROFILE_DIR = "E:\\MinecraftAiGod\\state\\players"
 ```
 
-If `py -3` is not accepted by the host, use the absolute Python executable path instead. Keep the password in a local environment/config mechanism rather than committing it.
+Keep the password in the local password file; do not commit it.
 
 Use [`prompts/god_system.md`](prompts/god_system.md) as the developer/system instruction for the Codex god session. It is intentionally story-oriented: the bridge provides power, while the prompt supplies restraint, continuity, and character.
 
@@ -137,15 +149,25 @@ Copy-Item build\libs\minecraft-god-paper-plugin-0.1.0.jar "$env:APPDATA\.minecra
 
 Edit `plugins/MinecraftGodBridge/config.yml` after the first server start if the player name or bridge URL differs. The plugin is intentionally read-only with respect to game powers: it only sends events to the local bridge. RCON remains the god's action channel.
 
+## Story trigger policy
+
+- Direct prayers, God-addressed public chat, deaths, story milestones, intervention requests/responses, and first joins wake a god immediately.
+- Ordinary public conversation and routine advancements accumulate silently. Dimension changes, major advancements, explosions, and pantheon reports are promoted only when they advance an active story or cross the salience threshold.
+- `god_action` and quits remain audit-only. Routine snapshots, block activity, item pickups, health telemetry, and mob kills accumulate for story context; active play can produce a presence pulse after two quiet minutes. Health at six hearts or below wakes immediately.
+- God-to-god messages wake only their recipient. Intervention responses wake the requester. A god's own commands and outbound messages never echo into another turn.
+- When an objective is registered, composite watches can recognize its actual world, region, inventory, or event conditions automatically. The god should not require the player to pray merely to announce completion.
+- Empty idle turns are disabled. Accumulated meaningful activity may trigger a presence pulse after two minutes, active stories flush after three minutes, and registered deadlines can wake independently.
+- Each model thread rotates after 12 meaningful turns; continuity comes from compact persistent God state. Retired threads are archived so their MCP subprocesses are released.
+
 ## Current limitations
 
-- Each god can act autonomously after its player's join, chat, death, advancement, dimension change, nearby explosion, or a pantheon message/request. The god remains silent while reasoning unless there is a deliberate story reason to speak.
+- Each god can act autonomously after a story-relevant trigger. A trigger permits a decision; it does not require speech or intervention.
 - Targeted powers are ownership-checked in the bridge. Cross-player effects require an approved, expiring, one-use intervention record in the SQLite ledger; raw selectors such as `@a`, `@p`, `@r`, and unscoped `@e` are rejected for player gods.
-- RCON gives the god command authority. The Paper plugin also exposes `/godscan`, which returns exact nearby non-air blocks, block states, sign text, entity positions, names, tags, and placement flags so the god can reason about a scene instead of guessing from entity counts.
+- RCON gives the god command authority. The Paper plugin exposes player-centred `/godscan` and `/godcheck`, plus remote `/godscanat` and `/godcheckat` commands. Remembered landmarks include a dimension and absolute coordinates, allowing the god to inspect, photograph, verify, and build at places such as a temple even when the player is elsewhere.
 - `capture_scene` points an invisible, server-side `SpectatorCamera` virtual camera at the observed build and returns two private, textured PNG views. It does not create a second account, move the player, interrupt the client, or notify the player. The camera is switched to manual mode for the request; the structured `/godscan` data remains authoritative for exact block identity and coordinates.
 - `search_structures` searches Modrinth for datapacks compatible with the configured Minecraft version. `import_structure` downloads a selected release, verifies its published hash, and extracts only `.nbt` structure templates into a generated datapack. It deliberately excludes arbitrary functions, loot, recipes, and world-generation content. `list_structures` exposes the resulting exact template IDs.
 - `place_structure` accepts vanilla or imported template IDs, supports rotation, and checks representative imported blocks after placement. Large or entity-heavy structures should still be inspected with `capture_scene` afterward.
-- Relative coordinates are anchored to the owning player by the convenience tools. Raw `minecraft_command` calls remain server-console commands unless `relative_to_player` is set, and the bridge rejects known cross-player targets.
+- Relative coordinates are anchored to the owning player by the convenience tools. Remote and cross-dimension actions require absolute coordinates and can preflight the destination without moving the player. Raw `minecraft_command` calls remain server-console commands unless `relative_to_player` is set, and the bridge rejects known cross-player targets.
 - Action results classify common Minecraft failures (`Expected literal`, `No entity was found`, and similar) as `ok: false`; a successful RCON round trip is not treated as proof that the requested action happened.
 - The first setup must be run once because Minecraft's EULA requires an explicit user decision. After that, the `.cmd` launcher is the one-click flow.
 

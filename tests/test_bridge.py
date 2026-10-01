@@ -46,6 +46,87 @@ def test_god_state_persists(tmp_path):
     assert reloaded.get_god_state()["current_interest"] == "diamonds"
 
 
+def test_god_state_memory_updates_append_instead_of_erasing_history(tmp_path):
+    bridge, _ = make_bridge(tmp_path, dry_run=True)
+    call_tool(bridge, "update_god_state", {"updates": {"memories": ["first", "second"]}})
+    call_tool(bridge, "update_god_state", {"updates": {"memories": ["second", "third"]}})
+    assert bridge.get_god_state()["memories"] == ["first", "second", "third"]
+
+
+def test_landmark_can_be_observed_remotely_without_moving_player(tmp_path):
+    class RemoteRcon(FakeRcon):
+        def command(self, command):
+            self.commands.append(command)
+            if command.startswith("godscanat "):
+                return type("Response", (), {"body": json.dumps({
+                    "position": "10 64 -20",
+                    "dimension": "minecraft:overworld",
+                    "blocks": [],
+                    "entities": [],
+                })})()
+            return type("Response", (), {"body": "ok"})()
+
+    rcon = RemoteRcon()
+    bridge = GodBridge(BridgeConfig(state_file=str(tmp_path / "state.json")), rcon=rcon)
+    call_tool(bridge, "remember_landmark", {"landmark": {
+        "name": "Old Temple",
+        "position": "10 64 -20",
+        "dimension": "overworld",
+        "aliases": ["temple"],
+    }})
+    result = call_tool(bridge, "observe_location", {"landmark_id": "old_temple"})
+    assert result["ok"] is True
+    assert result["landmark"]["position"] == "10 64 -20"
+    assert rcon.commands == ["godscanat minecraft:overworld 10 64 -20 12 8"]
+
+
+def test_dimension_aware_build_does_not_anchor_to_player(tmp_path):
+    bridge, rcon = make_bridge(tmp_path)
+    result = call_tool(bridge, "set_block", {
+        "block": "minecraft:gold_block",
+        "position": "10 64 -20",
+        "dimension": "minecraft:the_nether",
+    })
+    assert result["ok"] is True
+    assert rcon.commands == ["execute in minecraft:the_nether run setblock 10 64 -20 minecraft:gold_block"]
+
+
+def test_cross_dimension_teleport_preflight_inspects_remote_destination(tmp_path):
+    class RemoteRcon(FakeRcon):
+        def command(self, command):
+            self.commands.append(command)
+            y = int(command.split()[-2])
+            block = {
+                "type": "minecraft:stone" if y == 63 else "minecraft:air",
+                "passable": y != 63,
+                "solid": y == 63,
+                "liquid": False,
+            }
+            return type("Response", (), {"body": json.dumps(block)})()
+
+    rcon = RemoteRcon()
+    bridge = GodBridge(BridgeConfig(state_file=str(tmp_path / "state.json")), rcon=rcon)
+    result = bridge.teleport_preflight("10 64 -20", "the_nether")
+
+    assert result["ok"] is True
+    assert rcon.commands == [
+        "godcheckat minecraft:the_nether 10 64 -20",
+        "godcheckat minecraft:the_nether 10 65 -20",
+        "godcheckat minecraft:the_nether 10 63 -20",
+    ]
+
+
+def test_living_entity_placement_keeps_ai_by_default(tmp_path):
+    bridge, rcon = make_bridge(tmp_path)
+    call_tool(bridge, "place_entity_on_block", {
+        "entity_type": "minecraft:cow",
+        "block_position": "1 64 2",
+        "support_block": "minecraft:grass_block",
+        "name": "Provision",
+    })
+    assert "NoAI" not in rcon.commands[-1]
+
+
 def test_active_player_overrides_fallback_for_default_actions(tmp_path):
     active_file = tmp_path / "active_player.txt"
     bridge = GodBridge(
@@ -129,13 +210,47 @@ def test_place_sign_rejects_lines_that_do_not_fit_the_physical_sign(tmp_path):
 
 def test_sustained_abuse_triggers_an_immediate_consequence(tmp_path):
     bridge, rcon = make_bridge(tmp_path)
-    bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "fuckwit"})
-    bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "pussy"})
-    event = bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "retard"})
+    bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "god, you fuckwit"})
+    bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "god, you pussy"})
+    event = bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "god, you retard"})
 
     assert event["conduct"]["automatic_consequence"] is True
     assert any("summon minecraft:lightning_bolt" in command for command in rcon.commands)
     assert bridge.get_god_state()["consequence_count"] == 1
+
+
+def test_ordinary_profanity_not_directed_at_god_does_not_trigger_consequence(tmp_path):
+    bridge, rcon = make_bridge(tmp_path)
+    for _ in range(4):
+        bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "this fucking cave is awful"})
+    assert not any("lightning_bolt" in command for command in rcon.commands)
+
+
+def test_story_watches_persist_and_can_be_cleared(tmp_path):
+    bridge, _ = make_bridge(tmp_path, dry_run=True)
+    registered = call_tool(bridge, "register_story_watch", {"watch": {
+        "kind": "item",
+        "item": "minecraft:diamond",
+        "amount": 3,
+        "description": "The player gathers the promised diamonds.",
+    }})
+    watch_id = registered["watch"]["id"]
+    assert bridge.get_god_state()["story_watches"][0]["kind"] == "item"
+    cleared = call_tool(bridge, "clear_story_watch", {"watch_id": watch_id})
+    assert cleared["removed"] == 1
+
+
+def test_only_one_visible_message_per_controller_turn(tmp_path):
+    context = tmp_path / "turn-context.json"
+    context.write_text(json.dumps({"turn_id": "turn-1"}), encoding="utf-8")
+    bridge = GodBridge(BridgeConfig(
+        state_file=str(tmp_path / "state.json"),
+        turn_context_file=str(context),
+        dry_run=True,
+    ), rcon=FakeRcon())
+    bridge.god_whisper("Choose carefully.")
+    with pytest.raises(PermissionError, match="only one"):
+        bridge.god_whisper("I said choose carefully.")
 
 
 def test_capture_scene_returns_private_visual_views(tmp_path):

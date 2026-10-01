@@ -62,49 +62,67 @@ def sign_line_width(text: str) -> int:
 
 def tool_definitions() -> list[dict[str, Any]]:
     return [
-        {"name": "observe_world", "description": "Observe the configured player's telemetry, recent story context, and an exact local scene scan when the Paper bridge plugin supports it.", "inputSchema": {"type": "object", "properties": {}}},
-        {"name": "inspect_area", "description": "Inspect the exact local area around the player. Returns block types/states, sign text, and entity coordinates/custom names. Use this before placing or moving anything when location matters.", "inputSchema": {"type": "object", "properties": {"radius": {"type": "integer", "minimum": 1, "maximum": 12, "default": 8}, "vertical_radius": {"type": "integer", "minimum": 1, "maximum": 8, "default": 5}}}},
-        {"name": "inspect_block", "description": "Inspect one exact block at a coordinate in the player's current dimension, including solid, passable, liquid, and replaceable flags. Use this to validate a destination or build anchor before acting.", "inputSchema": {"type": "object", "properties": {"position": {"type": "string"}}, "required": ["position"]}},
-        {"name": "capture_scene", "description": "Capture two private textured views from the live exact block/entity scan using the invisible server-side camera. This does not move, interrupt, or notify the player. Use it when shape, composition, signs, or spatial relationships are hard to understand from structured blocks alone; the scan remains the physical authority.", "inputSchema": {"type": "object", "properties": {"radius": {"type": "integer", "minimum": 1, "maximum": 12, "default": 12}, "vertical_radius": {"type": "integer", "minimum": 1, "maximum": 8, "default": 8}}}},
+        {"name": "observe_world", "description": "Observe compact live player telemetry, persistent landmarks, objectives, and recent meaningful story context. Use this at the beginning of every decision.", "inputSchema": {"type": "object", "properties": {"include_scene": {"type": "boolean", "default": False}}}},
+        {"name": "observe_location", "description": "Observe a remembered landmark remotely without moving or notifying the player. Use named spatial memory instead of assuming the player's current location is the requested place.", "inputSchema": {"type": "object", "properties": {"landmark_id": {"type": "string"}, "radius": {"type": "integer", "minimum": 1, "maximum": 24, "default": 12}, "vertical_radius": {"type": "integer", "minimum": 1, "maximum": 16, "default": 8}, "include_scene": {"type": "boolean", "default": True}}, "required": ["landmark_id"]}},
+        {"name": "inspect_area", "description": "Inspect the exact local area around the player. Prefer inspect_area_at or observe_location for a named destination elsewhere.", "inputSchema": {"type": "object", "properties": {"radius": {"type": "integer", "minimum": 1, "maximum": 24, "default": 8}, "vertical_radius": {"type": "integer", "minimum": 1, "maximum": 16, "default": 5}}}},
+        {"name": "inspect_area_at", "description": "Inspect exact blocks, signs, and public entities around any absolute coordinate and dimension without moving the player. Chunks are loaded only for the scan.", "inputSchema": {"type": "object", "properties": {"position": {"type": "string"}, "dimension": {"type": "string", "default": "minecraft:overworld"}, "radius": {"type": "integer", "minimum": 1, "maximum": 24, "default": 8}, "vertical_radius": {"type": "integer", "minimum": 1, "maximum": 16, "default": 5}}, "required": ["position"]}},
+        {"name": "inspect_block", "description": "Inspect one exact block. Supply dimension for a remote or cross-dimensional check.", "inputSchema": {"type": "object", "properties": {"position": {"type": "string"}, "dimension": {"type": "string", "default": ""}}, "required": ["position"]}},
+        {"name": "inspect_blocks", "description": "Inspect up to 128 exact block positions in one model-visible batch. Prefer this over many inspect_block calls.", "inputSchema": {"type": "object", "properties": {"positions": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 128}, "dimension": {"type": "string", "default": ""}}, "required": ["positions"]}},
+        {"name": "capture_scene", "description": "Capture two private textured views around the player. The bridge chooses low-occlusion angles; exact scan data remains authoritative.", "inputSchema": {"type": "object", "properties": {"radius": {"type": "integer", "minimum": 1, "maximum": 24, "default": 12}, "vertical_radius": {"type": "integer", "minimum": 1, "maximum": 16, "default": 8}}}},
+        {"name": "capture_scene_at", "description": "Capture private textured views around an absolute coordinate and dimension without moving the player. Use this to verify remote landmarks and builds.", "inputSchema": {"type": "object", "properties": {"position": {"type": "string"}, "dimension": {"type": "string", "default": "minecraft:overworld"}, "radius": {"type": "integer", "minimum": 1, "maximum": 24, "default": 12}, "vertical_radius": {"type": "integer", "minimum": 1, "maximum": 16, "default": 8}}, "required": ["position"]}},
         {"name": "list_structures", "description": "List the vanilla and imported Java structure templates currently available to the God. Use this before placing a structure when you need an exact template ID.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "default": ""}}}},
         {"name": "search_structures", "description": "Search Modrinth for Minecraft Java datapacks compatible with the configured server version. This discovers candidate structure packs but does not install anything.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8}}, "required": ["query"]}},
         {"name": "import_structure", "description": "Download a selected Modrinth datapack or structure NBT, extract only its Java structure templates into a private datapack, enable it, and reload the server. Functions, loot tables, recipes, and world-generation files are deliberately excluded.", "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}, "version_id": {"type": "string", "default": ""}, "namespace": {"type": "string", "default": ""}}, "required": ["project_id"]}},
         {"name": "read_chat", "description": "Read recent Minecraft chat messages received by the bridge.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}}},
         {"name": "read_recent_events", "description": "Read recent Minecraft events received by the bridge or generated by god actions.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}}},
         {"name": "get_god_state", "description": "Read persistent hidden narrative state for the god character.", "inputSchema": {"type": "object", "properties": {}}},
-        {"name": "update_god_state", "description": "Persist narrative state fields such as disposition, current_interest, current_plan, chaos_budget, last_major_intervention, and memories.", "inputSchema": {"type": "object", "properties": {"updates": {"type": "object"}}, "required": ["updates"]}},
-        {"name": "minecraft_command", "description": "Execute an arbitrary Minecraft server command through local RCON. Do not include the leading slash. RCON is the server console; set relative_to_player=true when using ~ coordinates near the player.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string", "minLength": 1}, "relative_to_player": {"type": "boolean", "default": False}}, "required": ["command"]}},
+        {"name": "update_god_state", "description": "Persist narrative state. Memory updates append uniquely instead of replacing history; use landmark and objective tools for spatial facts and tests.", "inputSchema": {"type": "object", "properties": {"updates": {"type": "object"}}, "required": ["updates"]}},
+        {"name": "remember_landmark", "description": "Store or update a named spatial landmark with dimension, absolute anchor, optional bounds, aliases, and verification confidence.", "inputSchema": {"type": "object", "properties": {"landmark": {"type": "object"}}, "required": ["landmark"]}},
+        {"name": "list_landmarks", "description": "List or search the god's structured landmark memory before interpreting names such as home, temple, shrine, library, or portal.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "default": ""}}}},
+        {"name": "forget_landmark", "description": "Remove an obsolete landmark by id.", "inputSchema": {"type": "object", "properties": {"landmark_id": {"type": "string"}}, "required": ["landmark_id"]}},
+        {"name": "set_story_objective", "description": "Atomically create a narrative objective, unresolved promise, and deterministic watch. Use this instead of telling the player to pray after a detectable task.", "inputSchema": {"type": "object", "properties": {"objective": {"type": "object"}}, "required": ["objective"]}},
+        {"name": "complete_story_objective", "description": "Resolve an objective and remove its promise and watch after verified fulfillment, failure, or abandonment.", "inputSchema": {"type": "object", "properties": {"objective_id": {"type": "string"}, "outcome": {"type": "string", "enum": ["fulfilled", "failed", "abandoned"], "default": "fulfilled"}}, "required": ["objective_id"]}},
+        {"name": "register_story_watch", "description": "Register a deterministic wake condition. Kinds include event, region, item, block actions, health, mob kill, structure_change, and composite all/any conditions. Prefer set_story_objective for player-facing tests.", "inputSchema": {"type": "object", "properties": {"watch": {"type": "object"}}, "required": ["watch"]}},
+        {"name": "clear_story_watch", "description": "Remove a resolved or abandoned story watch by id.", "inputSchema": {"type": "object", "properties": {"watch_id": {"type": "string"}}, "required": ["watch_id"]}},
+        {"name": "preflight_command", "description": "Run cheap non-mutating validation for a raw Minecraft command before executing it. This checks ownership scope, command shape, and known sign limits without contacting the server.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string", "minLength": 1}}, "required": ["command"]}},
+        {"name": "minecraft_command", "description": "Execute an arbitrary Minecraft server command through local RCON after bridge preflight validation. Do not include the leading slash. RCON is the server console; set relative_to_player=true when using ~ coordinates near the player. Reuse idempotency_key when retrying the same intended action.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string", "minLength": 1}, "relative_to_player": {"type": "boolean", "default": False}, "idempotency_key": {"type": "string", "maxLength": 128}}, "required": ["command"]}},
         {"name": "god_say", "description": "Speak privately to your own player. This is the default and normal way for a god to communicate; the message is not shown to other players. (Legacy name retained.)", "inputSchema": {"type": "object", "properties": {"message": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["message"]}},
         {"name": "whisper_player", "description": "Speak privately to your own player. The message is not shown to other players.", "inputSchema": {"type": "object", "properties": {"message": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["message"]}},
         {"name": "broadcast_to_world", "description": "Make a rare public announcement to every online player. Use only when the story truly requires a world-wide proclamation; it is automatically attributed as [God of <your player>] so the audience knows which god is speaking.", "inputSchema": {"type": "object", "properties": {"message": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["message"]}},
-        {"name": "send_god_message", "description": "Send a private diplomatic message to another player's god. This communicates intent or information; it does not grant power or affect the other player.", "inputSchema": {"type": "object", "properties": {"target_player": {"type": "string", "description": "Other player's UUID or current name"}, "message": {"type": "string", "minLength": 1, "maxLength": 1000}, "subject": {"type": "string", "maxLength": 256}, "event_id": {"type": "integer"}}, "required": ["target_player", "message"]}},
+        {"name": "send_god_message", "description": "Send a private diplomatic message to another player's god. The player does not see this channel. Label the epistemic status carefully: report, request, warning, verified_fact, uncertain_claim, approval, or intent. A message is never authority by itself.", "inputSchema": {"type": "object", "properties": {"target_player": {"type": "string", "description": "Other player's UUID, current name, or unambiguous recent name"}, "message": {"type": "string", "minLength": 1, "maxLength": 1000}, "subject": {"type": "string", "maxLength": 256}, "event_id": {"type": "integer"}, "message_type": {"type": "string", "enum": ["intent", "report", "request", "warning", "verified_fact", "uncertain_claim", "approval"], "default": "intent"}, "verified": {"type": "boolean", "default": False}}, "required": ["target_player", "message"]}},
         {"name": "list_interventions", "description": "List incoming and outgoing god-to-god messages and intervention requests, including their approval status.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}}}},
         {"name": "request_intervention", "description": "Ask another player's god for one permissioned smite against that player's subject. The target god must explicitly approve it before use.", "inputSchema": {"type": "object", "properties": {"target_player": {"type": "string", "description": "The player whose god must approve the request"}, "reason": {"type": "string", "minLength": 1, "maxLength": 1000}, "event_id": {"type": "integer"}, "duration": {"type": "integer", "minimum": 60, "maximum": 3600, "default": 900}}, "required": ["target_player", "reason"]}},
         {"name": "respond_intervention", "description": "Approve or decline an incoming intervention request. Approval creates a single-use, expiring permission scoped to the requested target and action.", "inputSchema": {"type": "object", "properties": {"request_id": {"type": "string"}, "decision": {"type": "string", "enum": ["approve", "decline"]}, "note": {"type": "string", "maxLength": 1000}}, "required": ["request_id", "decision"]}},
         {"name": "use_intervention", "description": "Consume an approved one-use intervention permission and deliver the authorized smite. Only the requesting god can use it.", "inputSchema": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
         {"name": "punish_player", "description": "Deliver a confirmed, theatrical consequence to your own player. Use after sustained blasphemy or a deliberate narrative judgment; do not answer repeated abuse with words alone. Modes: smite (lightning now) or storm (thunder weather).", "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["smite", "storm"], "default": "smite"}}}},
         {"name": "spawn_entity", "description": "Summon an entity at a Minecraft coordinate string; use '~ ~ ~' to summon near the configured player only when that is intended.", "inputSchema": {"type": "object", "properties": {"entity_type": {"type": "string"}, "position": {"type": "string", "default": "~ ~ ~"}, "nbt": {"type": "string", "default": ""}}, "required": ["entity_type"]}},
-        {"name": "place_entity_on_block", "description": "Safely summon a named entity centered one block above an exact support block. The support must match and the target block plus head block must be air; the tool refuses to place an entity inside leaves, trees, walls, or water. The returned tag lets you address it reliably later.", "inputSchema": {"type": "object", "properties": {"entity_type": {"type": "string"}, "block_position": {"type": "string"}, "support_block": {"type": "string"}, "name": {"type": "string"}, "color": {"type": "string", "default": "gold"}, "tag": {"type": "string"}, "nbt": {"type": "string", "default": ""}, "no_ai": {"type": "boolean", "default": True}}, "required": ["entity_type", "block_position", "support_block", "name"]}},
+        {"name": "place_entity_on_block", "description": "Safely summon a named entity centered above a verified support block. Living entities keep normal AI unless no_ai=true is explicitly requested for a deliberate statue or tableau.", "inputSchema": {"type": "object", "properties": {"entity_type": {"type": "string"}, "block_position": {"type": "string"}, "support_block": {"type": "string"}, "name": {"type": "string"}, "color": {"type": "string", "default": "gold"}, "tag": {"type": "string"}, "nbt": {"type": "string", "default": ""}, "no_ai": {"type": "boolean", "default": False}, "idempotency_key": {"type": "string", "maxLength": 128}}, "required": ["entity_type", "block_position", "support_block", "name"]}},
         {"name": "move_entity_to_block", "description": "Move one tagged entity to the center one block above an exact support block, only when that block matches. Use the tag returned by place_entity_on_block.", "inputSchema": {"type": "object", "properties": {"tag": {"type": "string"}, "block_position": {"type": "string"}, "support_block": {"type": "string"}}, "required": ["tag", "block_position", "support_block"]}},
-        {"name": "place_sign", "description": "Place a readable four-line Minecraft sign and verify its stored front text. Each line is limited to 15 characters and approximately 90 vanilla-font pixels; use short coherent phrases, not wrapped chat sentences. Relative positions are anchored to the player; use an inspected position when the sign is part of the story.", "inputSchema": {"type": "object", "properties": {"position": {"type": "string", "default": "~ ~ ~1"}, "lines": {"type": "array", "items": {"type": "string", "maxLength": 15}, "minItems": 1, "maxItems": 4}, "rotation": {"type": "integer", "minimum": 0, "maximum": 15, "default": 0}, "material": {"type": "string", "default": "oak_sign"}, "color": {"type": "string", "default": "black"}, "glowing": {"type": "boolean", "default": False}}, "required": ["lines"]}},
+        {"name": "place_sign", "description": "Place a readable four-line Minecraft sign and verify its stored front text. Each line is limited to 15 characters and approximately 90 vanilla-font pixels; vanilla dye colors only. Reuse idempotency_key when retrying the same sign.", "inputSchema": {"type": "object", "properties": {"position": {"type": "string", "default": "~ ~ ~1"}, "lines": {"type": "array", "items": {"type": "string", "maxLength": 15}, "minItems": 1, "maxItems": 4}, "rotation": {"type": "integer", "minimum": 0, "maximum": 15, "default": 0}, "material": {"type": "string", "default": "oak_sign"}, "color": {"type": "string", "default": "black"}, "glowing": {"type": "boolean", "default": False}, "idempotency_key": {"type": "string", "maxLength": 128}}, "required": ["lines"]}},
         {"name": "give_item", "description": "Give an item stack to a player.", "inputSchema": {"type": "object", "properties": {"item": {"type": "string"}, "amount": {"type": "integer", "minimum": 1, "maximum": 2304, "default": 1}, "player": {"type": "string"}}, "required": ["item"]}},
         {"name": "set_weather", "description": "Set clear, rain, or thunder for a duration in seconds.", "inputSchema": {"type": "object", "properties": {"weather": {"type": "string", "enum": ["clear", "rain", "thunder"]}, "duration": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 600}}, "required": ["weather"]}},
         {"name": "set_time", "description": "Set Minecraft time using day, noon, night, midnight, or a numeric tick value.", "inputSchema": {"type": "object", "properties": {"time": {"type": "string"}}, "required": ["time"]}},
-        {"name": "teleport", "description": "Teleport a player to coordinates, optionally in a dimension.", "inputSchema": {"type": "object", "properties": {"target": {"type": "string"}, "position": {"type": "string"}, "dimension": {"type": "string"}}, "required": ["position"]}},
+        {"name": "teleport", "description": "Teleport a player to coordinates after a quick destination safety check. The default safe=true rejects occupied/liquid feet or head space and unsupported ground; use safe=false only for deliberate air/cross-dimension scenes. Reuse idempotency_key when retrying the same teleport.", "inputSchema": {"type": "object", "properties": {"target": {"type": "string"}, "position": {"type": "string"}, "dimension": {"type": "string"}, "safe": {"type": "boolean", "default": True}, "idempotency_key": {"type": "string", "maxLength": 128}}, "required": ["position"]}},
         {"name": "effect", "description": "Apply or clear a status effect.", "inputSchema": {"type": "object", "properties": {"effect": {"type": "string"}, "duration": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 30}, "amplifier": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0}, "player": {"type": "string"}}, "required": ["effect"]}},
-        {"name": "set_block", "description": "Set one block at coordinates.", "inputSchema": {"type": "object", "properties": {"block": {"type": "string"}, "position": {"type": "string"}}, "required": ["block", "position"]}},
-        {"name": "fill", "description": "Fill a cuboid between two coordinate strings with a block or block state.", "inputSchema": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "block": {"type": "string"}, "mode": {"type": "string", "enum": ["replace", "destroy", "hollow", "outline", "keep"], "default": "replace"}}, "required": ["from", "to", "block"]}},
-        {"name": "place_structure", "description": "Place a vanilla or imported Java structure template by exact ID, with optional rotation and representative-block verification for imported templates.", "inputSchema": {"type": "object", "properties": {"structure": {"type": "string"}, "position": {"type": "string"}, "rotation": {"type": "string", "enum": ["none", "clockwise_90", "clockwise_180", "counterclockwise_90"], "default": "none"}}, "required": ["structure", "position"]}},
+        {"name": "set_block", "description": "Set one block at coordinates, optionally in a remote dimension. Inspect the target location first.", "inputSchema": {"type": "object", "properties": {"block": {"type": "string"}, "position": {"type": "string"}, "dimension": {"type": "string", "default": ""}}, "required": ["block", "position"]}},
+        {"name": "fill", "description": "Fill a cuboid, optionally in a remote dimension. Prefer a small number of coherent fills followed by remote verification.", "inputSchema": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "block": {"type": "string"}, "dimension": {"type": "string", "default": ""}, "mode": {"type": "string", "enum": ["replace", "destroy", "hollow", "outline", "keep"], "default": "replace"}}, "required": ["from", "to", "block"]}},
+        {"name": "place_structure", "description": "Place a structure at exact coordinates, optionally in a remote dimension, with preview and representative-block verification.", "inputSchema": {"type": "object", "properties": {"structure": {"type": "string"}, "position": {"type": "string"}, "dimension": {"type": "string", "default": ""}, "rotation": {"type": "string", "enum": ["none", "clockwise_90", "clockwise_180", "counterclockwise_90"], "default": "none"}, "preview": {"type": "boolean", "default": False}, "idempotency_key": {"type": "string", "maxLength": 128}}, "required": ["structure", "position"]}},
     ]
 
 
 def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
     if name == "observe_world":
-        return bridge.observe_world()
+        return bridge.observe_world(bool(args.get("include_scene", False)))
+    if name == "observe_location":
+        return bridge.observe_location(args["landmark_id"], args.get("radius", 12), args.get("vertical_radius", 8), bool(args.get("include_scene", True)))
     if name == "inspect_area":
         return bridge.inspect_area(args.get("radius", 8), args.get("vertical_radius", 5))
+    if name == "inspect_area_at":
+        return bridge.inspect_area_at(args["position"], args.get("dimension", "minecraft:overworld"), args.get("radius", 8), args.get("vertical_radius", 5))
     if name == "inspect_block":
-        return bridge.inspect_block(args["position"])
+        return bridge.inspect_block(args["position"], args.get("dimension", ""))
+    if name == "inspect_blocks":
+        return bridge.inspect_blocks(args["positions"], args.get("dimension", ""))
     if name == "capture_scene":
         return bridge.capture_scene(
             args.get("radius", 12),
@@ -112,6 +130,8 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
             args.get("width", 900),
             args.get("height", 650),
         )
+    if name == "capture_scene_at":
+        return bridge.capture_scene_at(args["position"], args.get("dimension", "minecraft:overworld"), args.get("radius", 12), args.get("vertical_radius", 8))
     if name == "list_structures":
         return bridge.list_structures(args.get("query", ""))
     if name == "search_structures":
@@ -126,11 +146,30 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         return bridge.get_god_state()
     if name == "update_god_state":
         return bridge.update_god_state(args.get("updates", {}))
+    if name == "remember_landmark":
+        return bridge.remember_landmark(args["landmark"])
+    if name == "list_landmarks":
+        return bridge.list_landmarks(args.get("query", ""))
+    if name == "forget_landmark":
+        return bridge.forget_landmark(args["landmark_id"])
+    if name == "set_story_objective":
+        return bridge.set_story_objective(args["objective"])
+    if name == "complete_story_objective":
+        return bridge.complete_story_objective(args["objective_id"], args.get("outcome", "fulfilled"))
+    if name == "register_story_watch":
+        return bridge.register_story_watch(args["watch"])
+    if name == "clear_story_watch":
+        return bridge.clear_story_watch(args["watch_id"])
     if name == "minecraft_command":
         command = args["command"]
         if args.get("relative_to_player", False):
             command = bridge.command_at_player(command)
-        return bridge.execute(command)
+        preflight = bridge.preflight_command(command)
+        result = bridge.execute(command, idempotency_key=str(args.get("idempotency_key", "") or ""))
+        result["preflight"] = preflight
+        return result
+    if name == "preflight_command":
+        return bridge.preflight_command(args["command"])
     if name == "god_say":
         return bridge.god_say(args["message"])
     if name == "whisper_player":
@@ -138,7 +177,14 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
     if name == "broadcast_to_world":
         return bridge.god_broadcast(args["message"])
     if name == "send_god_message":
-        return bridge.send_god_message(args["target_player"], args["message"], subject=args.get("subject", ""), event_id=args.get("event_id"))
+        return bridge.send_god_message(
+            args["target_player"],
+            args["message"],
+            subject=args.get("subject", ""),
+            event_id=args.get("event_id"),
+            message_type=args.get("message_type", "intent"),
+            verified=bool(args.get("verified", False)),
+        )
     if name == "list_interventions":
         return {"ok": True, "interventions": bridge.list_interventions(args.get("limit", 20))}
     if name == "request_intervention":
@@ -159,7 +205,7 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         command = f"summon {entity} {position}{suffix}"
         if "~" in position:
             command = bridge.command_at_player(command)
-        return bridge.action("spawn_entity", lambda: command)
+        return bridge.action("spawn_entity", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
     if name == "place_entity_on_block":
         entity = parse_identifier(args["entity_type"], "entity_type")
         support_block = parse_identifier(args["support_block"], "support_block")
@@ -177,13 +223,13 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         custom_name = json.dumps({"text": entity_name, "color": color}, separators=(",", ":"))
         custom_name = custom_name.replace("'", "\\'")
         nbt_parts = [f"CustomName:'{custom_name}'", f"Tags:['{tag}']", "PersistenceRequired:1b"]
-        if args.get("no_ai", True):
+        if args.get("no_ai", False):
             nbt_parts.append("NoAI:1b")
         if extra.strip():
             nbt_parts.append(extra.strip().removeprefix("{").removesuffix("}"))
         x, y, z = block_position
         command = f"execute if block {x} {y} {z} {support_block} if block {x} {y + 1} {z} air if block {x} {y + 2} {z} air run summon {entity} {x}.5 {y + 1}.0 {z}.5 {{{','.join(nbt_parts)}}}"
-        result = bridge.action("place_entity_on_block", lambda: command)
+        result = bridge.action("place_entity_on_block", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
         verification = bridge.execute(f"data get entity @e[tag={tag},limit=1] Pos", record=False)
         result["tag"] = tag
         result["support_block"] = f"{support_block} at {x} {y} {z}"
@@ -229,7 +275,7 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         command = f"setblock {position} {block}"
         if "~" in position:
             command = bridge.command_at_player(command)
-        result = bridge.action("place_sign", lambda: command)
+        result = bridge.action("place_sign", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
         verify_command = f"data get block {position} front_text.messages"
         if "~" in position:
             verify_command = bridge.command_at_player(verify_command)
@@ -245,18 +291,18 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         else:
             player = parse_identifier(args.get("player", player), "player")
         amount = max(1, min(int(args.get("amount", 1)), 2304))
-        return bridge.action("give_item", lambda: f"give {player} {item} {amount}")
+        return bridge.action("give_item", lambda: f"give {player} {item} {amount}", idempotency_key=str(args.get("idempotency_key", "") or ""))
     if name == "set_weather":
         weather = args["weather"]
         if weather not in {"clear", "rain", "thunder"}:
             raise ValueError("weather must be clear, rain, or thunder")
         duration = max(1, min(int(args.get("duration", 600)), 100000))
-        return bridge.action("set_weather", lambda: f"weather {weather} {duration}")
+        return bridge.action("set_weather", lambda: f"weather {weather} {duration}", idempotency_key=str(args.get("idempotency_key", "") or ""))
     if name == "set_time":
         time = str(args["time"]).strip()
         if not time or len(time) > 30 or not all(c.isalnum() or c in "~+-" for c in time):
             raise ValueError("time must be a Minecraft time token")
-        return bridge.action("set_time", lambda: f"time set {time}")
+        return bridge.action("set_time", lambda: f"time set {time}", idempotency_key=str(args.get("idempotency_key", "") or ""))
     if name == "teleport":
         target = bridge.current_player_name()
         if bridge.owner_id:
@@ -265,6 +311,9 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
             target = parse_identifier(args.get("target", target), "target")
         position = parse_position(args["position"])
         dimension = args.get("dimension", "")
+        preflight = bridge.teleport_preflight(position, dimension) if args.get("safe", True) else {"ok": None, "status": "safety-check-bypassed", "checks": []}
+        if preflight.get("ok") is False:
+            return {"ok": False, "action": "teleport", "position": list(preflight.get("position", [])), "preflight": preflight, "error": "Teleport refused because the destination failed its safety check."}
         if dimension:
             dimension = parse_identifier(dimension, "dimension")
             command = f"execute in {dimension} run tp {target} {position}"
@@ -272,7 +321,9 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
             command = f"tp {target} {position}"
         if "~" in position:
             command = bridge.command_at_player(command)
-        return bridge.action("teleport", lambda: command)
+        result = bridge.action("teleport", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
+        result["preflight"] = preflight
+        return result
     if name == "effect":
         effect = parse_identifier(args["effect"], "effect")
         player = bridge.current_player_name()
@@ -282,14 +333,20 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
             player = parse_identifier(args.get("player", player), "player")
         duration = max(1, min(int(args.get("duration", 30)), 100000))
         amplifier = max(0, min(int(args.get("amplifier", 0)), 255))
-        return bridge.action("effect", lambda: f"effect give {player} {effect} {duration} {amplifier}")
+        return bridge.action("effect", lambda: f"effect give {player} {effect} {duration} {amplifier}", idempotency_key=str(args.get("idempotency_key", "") or ""))
     if name == "set_block":
         block = parse_identifier(args["block"], "block")
         position = parse_position(args["position"])
         command = f"setblock {position} {block}"
-        if "~" in position:
+        dimension = str(args.get("dimension", "") or "")
+        if dimension:
+            dimension = parse_identifier(dimension, "dimension")
+            if "~" in position:
+                raise ValueError("remote dimension block placement requires absolute coordinates")
+            command = f"execute in {dimension} run {command}"
+        elif "~" in position:
             command = bridge.command_at_player(command)
-        return bridge.action("set_block", lambda: command)
+        return bridge.action("set_block", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
     if name == "fill":
         from_pos = parse_position(args["from"])
         to_pos = parse_position(args["to"])
@@ -298,14 +355,20 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         if mode not in {"replace", "destroy", "hollow", "outline", "keep"}:
             raise ValueError("invalid fill mode")
         command = f"fill {from_pos} {to_pos} {block} {mode}"
-        if "~" in from_pos or "~" in to_pos:
+        dimension = str(args.get("dimension", "") or "")
+        if dimension:
+            dimension = parse_identifier(dimension, "dimension")
+            if "~" in from_pos or "~" in to_pos:
+                raise ValueError("remote dimension fills require absolute coordinates")
+            command = f"execute in {dimension} run {command}"
+        elif "~" in from_pos or "~" in to_pos:
             command = bridge.command_at_player(command)
-        return bridge.action("fill", lambda: command)
+        return bridge.action("fill", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
     if name == "place_structure":
         structure = parse_identifier(args["structure"], "structure")
         position = parse_position(args["position"])
         rotation = args.get("rotation", "none")
-        return bridge.place_structure(structure, position, rotation)
+        return bridge.place_structure(structure, position, rotation, bool(args.get("preview", False)), str(args.get("idempotency_key", "") or ""), str(args.get("dimension", "") or ""))
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -433,7 +496,7 @@ def config_from_env(config_file: str | None = None) -> BridgeConfig:
         values = json.loads(Path(config_file).read_text(encoding="utf-8"))
         if not isinstance(values, dict):
             raise ValueError("config file must contain a JSON object")
-        for field in ("rcon_host", "rcon_port", "rcon_password", "player_name", "god_player_id", "god_player_name", "profile_dir", "active_player_file", "event_host", "event_port", "event_token", "state_file", "events_file", "ledger_file", "max_gods", "require_god_scope", "dry_run", "max_command_length", "camera_output_dir", "camera_plugin_render_dir", "camera_timeout", "structure_catalog_file", "structure_datapacks_dir", "structure_download_dir", "structure_max_download_mb", "minecraft_version"):
+        for field in ("rcon_host", "rcon_port", "rcon_password", "player_name", "god_player_id", "god_player_name", "profile_dir", "active_player_file", "turn_context_file", "event_host", "event_port", "event_token", "state_file", "events_file", "ledger_file", "max_gods", "require_god_scope", "dry_run", "max_command_length", "camera_output_dir", "camera_plugin_render_dir", "camera_timeout", "structure_catalog_file", "structure_datapacks_dir", "structure_download_dir", "structure_max_download_mb", "minecraft_version", "repeated_speech_cooldown"):
             if field in values:
                 setattr(config, field, values[field])
 
@@ -446,6 +509,7 @@ def config_from_env(config_file: str | None = None) -> BridgeConfig:
         "MINECRAFT_GOD_PLAYER_ID": ("god_player_id", str),
         "MINECRAFT_PROFILE_DIR": ("profile_dir", str),
         "MINECRAFT_ACTIVE_PLAYER_FILE": ("active_player_file", str),
+        "MINECRAFT_TURN_CONTEXT_FILE": ("turn_context_file", str),
         "MINECRAFT_EVENT_HOST": ("event_host", str),
         "MINECRAFT_EVENT_PORT": ("event_port", int),
         "MINECRAFT_EVENT_TOKEN": ("event_token", str),
@@ -463,6 +527,7 @@ def config_from_env(config_file: str | None = None) -> BridgeConfig:
         "MINECRAFT_STRUCTURE_DOWNLOAD_DIR": ("structure_download_dir", str),
         "MINECRAFT_STRUCTURE_MAX_DOWNLOAD_MB": ("structure_max_download_mb", int),
         "MINECRAFT_VERSION": ("minecraft_version", str),
+        "MINECRAFT_REPEATED_SPEECH_COOLDOWN": ("repeated_speech_cooldown", int),
     }
     for environment_name, (field, converter) in env_values.items():
         if environment_name in os.environ:

@@ -5,10 +5,10 @@ Set-Location $Root
 # This deliberately targets only the controller wrapper and its child Codex
 # app-server processes. Paper and the event hub are sibling processes and are
 # left running, so connected players remain in the world.
-$controller = Get-CimInstance Win32_Process | Where-Object {
+$controllers = Get-CimInstance Win32_Process | Where-Object {
     $_.CommandLine -match 'god_bridge\.controller' -and $_.CommandLine -match 'python|py\.exe'
-} | Select-Object -First 1
-if ($controller) {
+} | Sort-Object ProcessId
+foreach ($controller in $controllers) {
     & taskkill.exe /PID $controller.ProcessId /T /F | Out-Null
     Start-Sleep -Milliseconds 500
 }
@@ -18,7 +18,12 @@ $env:MINECRAFT_EVENTS_FILE = Join-Path $Root "state\events.jsonl"
 $env:MINECRAFT_LEDGER_FILE = Join-Path $Root "state\god_ledger.sqlite3"
 $env:MINECRAFT_PROFILE_DIR = Join-Path $Root "state\players"
 $env:MINECRAFT_MAX_GODS = "32"
+$env:MINECRAFT_GOD_IDLE_SECONDS = "120"
+$env:MINECRAFT_GOD_STORY_INTERVAL_SECONDS = "180"
+$env:MINECRAFT_GOD_MAX_THREAD_TURNS = "12"
+$env:MINECRAFT_GOD_LOG_MAX_BYTES = "26214400"
 $env:MINECRAFT_GOD_READY_FILE = Join-Path $Root "logs\god-controller.ready"
+$env:MINECRAFT_GOD_CONTROLLER_LOCK_FILE = Join-Path $Root "logs\god-controller.lock"
 $env:MINECRAFT_GOD_LOG_DIR = Join-Path $Root "logs"
 Remove-Item -LiteralPath $env:MINECRAFT_GOD_READY_FILE -Force -ErrorAction SilentlyContinue
 
