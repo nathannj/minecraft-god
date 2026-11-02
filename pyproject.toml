@@ -15,7 +15,7 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest==9.1.1", "build==1.6.1", "ruff==0.17.0"]
 audit = ["pip-audit==2.10.1"]
-voice = ["faster-whisper==1.2.1", "av==16.0.1"]
+voice = ["faster-whisper==1.2.1", "av==18.1.0"]
 
 [project.scripts]
 minecraft-god = "god_bridge.mcp_server:main"
