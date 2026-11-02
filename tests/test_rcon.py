@@ -100,3 +100,23 @@ def test_command_keeps_response_when_paper_omits_empty_sentinel(monkeypatch):
     response = rcon.RconClient("127.0.0.1", 25575, "password").command("time query daytime")
 
     assert response.body == "There are 0 players online"
+
+
+def test_marker_waits_until_real_command_has_responded(monkeypatch):
+    class OrderedSocket:
+        def __init__(self):
+            self.buffer = bytearray()
+            self.command_response_read = False
+        def sendall(self, packet):
+            value = decode_packet(packet[4:])
+            if value.body == "list":
+                assert self.command_response_read, "Paper can reject coalesced command requests"
+            self.buffer.extend(encode_packet(value.request_id, 0, "marker" if value.body == "list" else "confirmed"))
+        def recv(self, size):
+            result = bytes(self.buffer[:size])
+            del self.buffer[:size]
+            if not self.buffer:
+                self.command_response_read = True
+            return result
+    response = rcon.RconClient("localhost", 25575, "")._command(OrderedSocket(), "godcheckbatch minecraft:overworld 0,64,0")
+    assert response.body == "confirmed"

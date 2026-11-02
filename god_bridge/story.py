@@ -33,7 +33,40 @@ class EventDecision:
 def story_is_active(state: dict[str, Any] | None) -> bool:
     state = state or {}
     phase = str(state.get("story_phase", "dormant")).casefold()
+    if phase == "cooldown":
+        return False
+    eligible = state.get("next_eligible_intervention_at")
+    if eligible:
+        try:
+            deadline = datetime.fromisoformat(str(eligible).replace("Z", "+00:00"))
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            if deadline > datetime.now(timezone.utc):
+                return False
+        except ValueError:
+            pass
     return bool(state.get("active_thread")) or phase in {"hook", "test", "consequence"}
+
+
+def event_priority(event: dict[str, Any]) -> int:
+    """Emergencies preempt construction; prayers precede background activity."""
+    if event.get("type") == "event_batch":
+        return max((event_priority(item) for item in event.get("events", [])), default=0)
+    if event.get("type") == "player_death":
+        return 3
+    if event.get("type") == "health_threshold":
+        try:
+            if float(event.get("health", 999)) <= 6:
+                return 3
+        except (ValueError, TypeError):
+            pass
+    if event.get("type") in {"player_prayer", "god_message", "intervention_request", "intervention_response", "agreement_proposal", "agreement_response"}:
+        return 2
+    if event.get("type") == "story_milestone":
+        return max(1, event_priority(event.get("matched_event", {})))
+    if event.get("type") == "deferred_work":
+        return 1
+    return 0
 
 
 def event_targets(event: dict[str, Any], player_id: str, player_name: str) -> bool:
@@ -43,8 +76,15 @@ def event_targets(event: dict[str, Any], player_id: str, player_name: str) -> bo
     player_id = player_id.casefold()
     player_name = player_name.casefold()
 
+    if event_type == "voice_transcript":
+        return str(event.get("player_uuid", "")).casefold() == player_id or any(
+            str(p.get("player_uuid", "")).casefold() == player_id for p in event.get("routed_listeners", [])
+        )
+
     if event_type == "god_action":
         return False
+    if event_type in {"agreement_proposal", "agreement_response"}:
+        return player_id in event.get("participant_ids", []) and player_id != event.get("from_player_id")
     if policy in {"recipient", "target"} or event_type in {"god_message", "intervention_request"}:
         return str(event.get("to_player_id") or event.get("target_player_id") or "").casefold() == player_id
     if policy == "requester" or event_type == "intervention_response":
@@ -57,9 +97,11 @@ def event_targets(event: dict[str, Any], player_id: str, player_name: str) -> bo
     return bool(player_name and str(event.get("player", "")).casefold() == player_name)
 
 
-def classify_event(event: dict[str, Any], state: dict[str, Any] | None = None) -> EventDecision:
+def classify_event(event: dict[str, Any], state: dict[str, Any] | None = None, *, player_id: str = "") -> EventDecision:
     event_type = str(event.get("type", "unknown")).casefold()
     policy = str(event.get("wake_policy", "")).casefold()
+    if event_type == "voice_transcript" and player_id and event.get("player_uuid") != player_id:
+        return EventDecision("accumulate", 1, "overheard proximity conversation")
     if event_type == "health_threshold":
         try:
             health = float(event.get("health", 999))
@@ -74,7 +116,7 @@ def classify_event(event: dict[str, Any], state: dict[str, Any] | None = None) -
         return EventDecision("wake", 5, "immediate decision event")
     if event_type in {"player_join", "god_resume"}:
         return EventDecision("wake", 5, "session opening")
-    if event_type in {"chat", "player_chat"}:
+    if event_type in {"chat", "player_chat", "voice_transcript"}:
         conduct = event.get("conduct") if isinstance(event.get("conduct"), dict) else {}
         if conduct.get("automatic_consequence"):
             return EventDecision("wake", 5, "automatic consequence requires acknowledgment")
@@ -106,13 +148,25 @@ def compact_event(event: dict[str, Any]) -> dict[str, Any]:
         "private", "command", "advancement", "from", "to", "entity", "position",
         "block", "item", "amount", "health", "subject", "message_type", "verified",
         "interaction_id", "decision", "note", "conduct", "watch", "matched_event",
-        "summary", "count", "inventory", "dimension",
+        "summary", "count", "inventory", "dimension", "presence_context", "source",
+        "player_uuid", "victim_uuid", "killer_uuid", "from_player_id", "to_player_id",
+        "participant_ids", "agreement_id", "status", "reason", "action", "wake_policy",
+        "voice_mode", "started_at", "ended_at", "duration_seconds", "transcribed_at",
+        "nearby_players", "routed_listeners", "possible_recipients", "listener_evidence", "transcription", "label",
     }
     compact = {key: value for key, value in event.items() if key in keep and value is not None and value != ""}
     if "message" in compact:
         compact["message"] = str(compact["message"])[:1000]
     if isinstance(compact.get("matched_event"), dict):
         compact["matched_event"] = compact_event(compact["matched_event"])
+    if isinstance(compact.get("presence_context"), dict):
+        context = compact["presence_context"]
+        compact["presence_context"] = {
+            "summary": context.get("summary", {}),
+            "changes": context.get("changes", {}),
+            "latest_snapshot": compact_event(context["latest_snapshot"]) if isinstance(context.get("latest_snapshot"), dict) else None,
+            "notable_events": [compact_event(item) for item in context.get("notable_events", [])[-8:]],
+        }
     return compact
 
 
@@ -138,7 +192,9 @@ def coalesce_events(events: list[dict[str, Any]], limit: int = 12) -> dict[str, 
         others.extend(advancements)
     if len(others) > limit:
         omitted = len(others) - limit
-        others = others[-limit:]
+        # A flood of recipe unlocks must not discard an emergency or prayer.
+        others = sorted(sorted(enumerate(others), key=lambda pair: (event_priority(pair[1]), pair[0]), reverse=True)[:limit])
+        others = [item for _, item in others]
         others.insert(0, {"type": "event_summary", "count": omitted, "summary": f"{omitted} older low-salience events omitted."})
     if len(others) == 1:
         return others[0]
@@ -163,11 +219,15 @@ def _position(value: Any) -> tuple[float, float, float] | None:
 def watch_matches(watch: dict[str, Any], event: dict[str, Any]) -> bool:
     kind = str(watch.get("kind", "event")).casefold()
     event_type = str(event.get("type", "")).casefold()
+    if watch.get("dimension") and event.get("dimension") != watch["dimension"]:
+        return False
     if kind in {"all", "any"}:
         conditions = watch.get("conditions", [])
         if not isinstance(conditions, list) or not conditions:
             return False
-        matches = [watch_matches(condition, event) for condition in conditions if isinstance(condition, dict)]
+        if any(not isinstance(condition, dict) for condition in conditions):
+            return False
+        matches = [watch_matches(condition, event) for condition in conditions]
         return bool(matches) and (all(matches) if kind == "all" else any(matches))
     if kind == "event":
         expected = str(watch.get("event_type", "")).casefold()
@@ -221,6 +281,26 @@ def watch_matches(watch: dict[str, Any], event: dict[str, Any]) -> bool:
     return False
 
 
+def activity_changes(previous: dict[str, Any] | None, latest: dict[str, Any] | None, events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Facts about preparation and work, without assigning moral intent."""
+    counts: dict[str, int] = {}
+    blocks: dict[str, int] = {}
+    for event in events:
+        kind = str(event.get("type", "unknown"))
+        counts[kind] = counts.get(kind, 0) + 1
+        if kind in {"block_place", "block_break"}:
+            key = f"{kind}:{event.get('block', 'unknown')}"
+            blocks[key] = blocks.get(key, 0) + 1
+    result: dict[str, Any] = {"event_counts": counts, "block_work": blocks}
+    if previous and latest:
+        before, after = previous.get("inventory", {}), latest.get("inventory", {})
+        result["inventory_delta"] = {key: int(after.get(key, 0)) - int(before.get(key, 0)) for key in set(before) | set(after) if int(after.get(key, 0)) != int(before.get(key, 0))}
+        result["health_change"] = float(latest.get("health", 20)) - float(previous.get("health", 20))
+        result["dimension_changed"] = previous.get("dimension") != latest.get("dimension")
+    result["interpretation"] = "Activity is evidence of work or preparation, not proof of distraction, refusal, or abandonment."
+    return result
+
+
 def watch_deadline_due(watch: dict[str, Any], now: datetime | None = None) -> bool:
     deadline = watch.get("deadline")
     if not deadline:
@@ -232,3 +312,42 @@ def watch_deadline_due(watch: dict[str, Any], now: datetime | None = None) -> bo
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed <= (now or datetime.now(timezone.utc))
+
+
+def validate_watch(watch: dict[str, Any], depth: int = 0) -> dict[str, Any]:
+    if depth > 3:
+        raise ValueError("watch nesting must be at most three levels")
+    clean = dict(watch)
+    kind = str(clean.get("kind", "event")).casefold()
+    clean["kind"] = kind
+    if kind in {"all", "any"}:
+        conditions = clean.get("conditions")
+        if not isinstance(conditions, list) or not 2 <= len(conditions) <= 8 or any(not isinstance(item, dict) for item in conditions):
+            raise ValueError("composite watches require 2 to 8 valid conditions")
+        clean["conditions"] = [validate_watch(item, depth + 1) for item in conditions]
+    elif kind == "event":
+        clean["event_type"] = str(clean.get("event_type") or clean.get("type") or "")
+        if not clean["event_type"]:
+            raise ValueError("event watch requires event_type")
+    elif kind in {"region", "structure_change"}:
+        if _position(clean.get("position")) is None:
+            raise ValueError("spatial watch requires an absolute position")
+    elif kind == "item":
+        if not clean.get("item"):
+            raise ValueError("item watch requires an item identifier")
+        clean["amount"] = max(1, int(clean.get("amount", 1)))
+    elif kind not in {"block_place", "block_break", "health_below", "mob_kill"}:
+        raise ValueError("unsupported watch kind")
+    if "position" in clean:
+        point = _position(clean["position"])
+        if point is None or not all(math.isfinite(value) for value in point):
+            raise ValueError("watch position must contain finite absolute coordinates")
+    if kind == "health_below":
+        clean["health"] = float(clean.get("health", 6))
+        if not math.isfinite(clean["health"]) or not 0 <= clean["health"] <= 20:
+            raise ValueError("watch health must be between 0 and 20 points")
+    if "radius" in clean and (not math.isfinite(float(clean["radius"])) or float(clean["radius"]) < 0):
+        raise ValueError("watch radius must be finite and nonnegative")
+    if clean.get("deadline"):
+        datetime.fromisoformat(str(clean["deadline"]).replace("Z", "+00:00"))
+    return clean

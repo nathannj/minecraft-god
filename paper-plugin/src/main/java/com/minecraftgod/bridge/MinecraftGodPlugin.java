@@ -54,8 +54,12 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
     private String bridgeUrl;
     private String bridgeToken;
     private String playerName;
+    private EventOutbox outbox;
+    private VoiceBridge voiceBridge;
     private final Map<UUID, String> lastSnapshot = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> lastHealthBand = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> lastPrayer = new ConcurrentHashMap<>();
+    private final Map<Chunk, Long> ticketExpiry = new HashMap<>();
 
     @Override
     public void onEnable() {
@@ -63,7 +67,14 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         bridgeUrl = getConfig().getString("bridge-url", "http://127.0.0.1:8765/events");
         bridgeToken = getConfig().getString("bridge-token", "");
         playerName = getConfig().getString("player-name", "");
+        outbox = new EventOutbox(http, bridgeUrl, bridgeToken, getDataFolder().toPath().resolve("pending-events.queue"), getLogger());
         Bukkit.getPluginManager().registerEvents(this, this);
+        new MapShortcuts(this, this::sendEvent);
+        if (getConfig().getBoolean("voice-transcription.enabled", true)
+                && Bukkit.getPluginManager().isPluginEnabled("voicechat")) {
+            voiceBridge = new VoiceBridge(this, bridgeUrl, bridgeToken);
+            voiceBridge.start();
+        }
         // Cheap deterministic telemetry supports story watches without waking
         // an LLM.  A snapshot is emitted only when its contents have changed.
         Bukkit.getScheduler().runTaskTimer(this, this::emitChangedSnapshots, 100L, 300L);
@@ -81,6 +92,11 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         }
 
         getLogger().info("Minecraft God bridge enabled: " + bridgeUrl);
+    }
+
+    @Override public void onDisable() {
+        if (voiceBridge != null) voiceBridge.close();
+        if (outbox != null) outbox.close();
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -104,6 +120,9 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onQuit(PlayerQuitEvent event) {
+        lastSnapshot.remove(event.getPlayer().getUniqueId());
+        lastHealthBand.remove(event.getPlayer().getUniqueId());
+        lastPrayer.remove(event.getPlayer().getUniqueId());
         if (isTracked(event.getPlayer())) {
             sendEvent(event("player_quit", Map.of(
                     "player", event.getPlayer().getName(),
@@ -162,6 +181,7 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
                     "player", tracked.getName(),
                     "player_uuid", tracked.getUniqueId().toString(),
                     "entity", event.getEntityType().getKey().toString(),
+                    "dimension", location.getWorld().getKey().toString(),
                     "position", position(location)
             )));
         }
@@ -174,6 +194,7 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
                 "player", player.getName(),
                 "player_uuid", player.getUniqueId().toString(),
                 "block", event.getBlockPlaced().getType().getKey().toString(),
+                "dimension", event.getBlockPlaced().getLocation().getWorld().getKey().toString(),
                 "position", position(event.getBlockPlaced().getLocation()),
                 "wake_policy", "never"
         )));
@@ -186,6 +207,7 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
                 "player", player.getName(),
                 "player_uuid", player.getUniqueId().toString(),
                 "block", event.getBlock().getType().getKey().toString(),
+                "dimension", event.getBlock().getLocation().getWorld().getKey().toString(),
                 "position", position(event.getBlock().getLocation()),
                 "wake_policy", "never"
         )));
@@ -219,6 +241,7 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
                 "player", killer.getName(),
                 "player_uuid", killer.getUniqueId().toString(),
                 "entity", event.getEntityType().getKey().toString(),
+                "dimension", event.getEntity().getLocation().getWorld().getKey().toString(),
                 "position", position(event.getEntity().getLocation()),
                 "wake_policy", "never"
         )));
@@ -276,6 +299,19 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
      */
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (command.getName().equalsIgnoreCase("godsmite")) {
+            Player target = args.length == 1 ? Bukkit.getPlayerExact(args[0]) : null;
+            if (target == null) sender.sendMessage("{\"ok\":false,\"error\":\"player_not_found\"}");
+            else {
+                target.getWorld().strikeLightningEffect(target.getLocation());
+                target.damage(5.0);
+                sender.sendMessage("{\"ok\":true,\"action\":\"scoped_smite\"}");
+            }
+            return true;
+        }
+        if (List.of("godobserve", "godcheckbatch", "godsurface", "godfootprint", "godvalidate").contains(command.getName().toLowerCase())) {
+            return compactObservation(sender, command.getName().toLowerCase(), args);
+        }
         if (command.getName().equalsIgnoreCase("pray")) {
             return prayer(sender, args, "pray");
         }
@@ -330,6 +366,14 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
             sender.sendMessage("Your prayer is too long (maximum 1000 characters).");
             return true;
         }
+        long now = System.nanoTime();
+        long cooldown = java.util.concurrent.TimeUnit.SECONDS.toNanos(Math.max(0, getConfig().getInt("prayer-cooldown-seconds", 10)));
+        Long previous = lastPrayer.get(player.getUniqueId());
+        if (previous != null && now - previous < cooldown) {
+            sender.sendMessage("Give your god a moment before sending another prayer.");
+            return true;
+        }
+        lastPrayer.put(player.getUniqueId(), now);
         sendEvent(event("player_prayer", Map.of(
                 "player", player.getName(),
                 "player_uuid", player.getUniqueId().toString(),
@@ -338,6 +382,108 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
                 "command", commandName
         )));
         sender.sendMessage("Your words reach the god who watches you.");
+        return true;
+    }
+
+    private boolean compactObservation(CommandSender sender, String operation, String[] args) {
+        try {
+            if (operation.equals("godobserve") || operation.equals("godsurface")) {
+                Player player = args.length > 0 ? Bukkit.getPlayerExact(args[0]) : null;
+                if (player == null) throw new IllegalArgumentException("player_not_found");
+                World world = player.getWorld();
+                if (operation.equals("godobserve")) {
+                    Map<String, Integer> inventory = new LinkedHashMap<>();
+                    for (ItemStack item : player.getInventory().getContents()) {
+                        if (item != null && !item.getType().isAir()) inventory.merge(item.getType().getKey().toString(), item.getAmount(), Integer::sum);
+                    }
+                    Map<String, Object> value = new LinkedHashMap<>();
+                    value.put("ok", true);
+                    value.put("player", player.getName());
+                    value.put("player_uuid", player.getUniqueId().toString());
+                    value.put("dimension", world.getKey().toString());
+                    value.put("position", position(player.getLocation()));
+                    value.put("health", player.getHealth());
+                    value.put("food", player.getFoodLevel());
+                    value.put("inventory", inventory);
+                    sender.sendMessage(toJson(value));
+                    return true;
+                }
+                int x = player.getLocation().getBlockX(), z = player.getLocation().getBlockZ();
+                for (int y = world.getHighestBlockYAt(x, z); y >= world.getMinHeight(); y--) {
+                    Block support = world.getBlockAt(x, y, z);
+                    if (y + 2 >= world.getMaxHeight() || !support.getType().isSolid() || support.isLiquid()
+                            || support.getType().name().contains("LEAVES") || support.getType().name().contains("LOG")
+                            || List.of("MAGMA_BLOCK", "CACTUS", "CAMPFIRE", "SOUL_CAMPFIRE").contains(support.getType().name())) continue;
+                    Block feet = world.getBlockAt(x, y + 1, z), head = world.getBlockAt(x, y + 2, z);
+                    if (feet.getType().isAir() && head.getType().isAir()) {
+                        sender.sendMessage(toJson(Map.of("ok", true, "dimension", world.getKey().toString(), "position", x + " " + (y + 1) + " " + z, "support", blockDescription(world, support, x, y, z))));
+                        return true;
+                    }
+                }
+                throw new IllegalArgumentException("no_safe_surface");
+            }
+            if (operation.equals("godcheckbatch")) {
+                if (args.length < 2 || args.length > 129) throw new IllegalArgumentException("batch_requires_1_to_128_positions");
+                World world = worldFor(args[0]);
+                if (world == null) throw new IllegalArgumentException("dimension_not_found");
+                List<Map<String, Object>> results = new ArrayList<>();
+                for (int i = 1; i < args.length; i++) {
+                    String[] xyz = args[i].split(",");
+                    if (xyz.length != 3) throw new IllegalArgumentException("invalid_batch_position");
+                    int x = Integer.parseInt(xyz[0]), y = Integer.parseInt(xyz[1]), z = Integer.parseInt(xyz[2]);
+                    if (y < world.getMinHeight() || y >= world.getMaxHeight()) throw new IllegalArgumentException("position_outside_world_height");
+                    Chunk chunk = world.getChunkAt(x >> 4, z >> 4);
+                    chunk.addPluginChunkTicket(this);
+                    try { results.add(Map.of("ok", true, "block", blockDescription(world, world.getBlockAt(x, y, z), x, y, z))); }
+                    finally { releaseChunkTicketSoon(chunk); }
+                }
+                sender.sendMessage(toJson(Map.of("ok", true, "dimension", world.getKey().toString(), "results", results)));
+                return true;
+            }
+            int offset = operation.equals("godvalidate") ? 1 : 0;
+            if (args.length != 7 + offset) throw new IllegalArgumentException("dimension_and_six_bounds_required");
+            World world = worldFor(args[offset]);
+            if (world == null) throw new IllegalArgumentException("dimension_not_found");
+            int[] min = new int[3], max = new int[3];
+            for (int i = 0; i < 3; i++) {
+                min[i] = Integer.parseInt(args[offset + 1 + i]);
+                max[i] = Integer.parseInt(args[offset + 4 + i]);
+                if (min[i] > max[i]) throw new IllegalArgumentException("invalid_bounds");
+            }
+            List<String> others = new ArrayList<>();
+            for (Player player : world.getPlayers()) {
+                Location p = player.getLocation();
+                if (operation.equals("godvalidate") && player.getName().equals(args[0])) continue;
+                if (p.getX() >= min[0] && p.getX() < max[0] + 1 && p.getY() >= min[1] && p.getY() < max[1] + 1 && p.getZ() >= min[2] && p.getZ() < max[2] + 1) others.add(player.getUniqueId().toString());
+            }
+            if (operation.equals("godvalidate")) {
+                if (max[0] - min[0] > 160 || max[2] - min[2] > 160) throw new IllegalArgumentException("affected_area_too_large");
+                for (int cx = min[0] >> 4; cx <= max[0] >> 4; cx++) for (int cz = min[2] >> 4; cz <= max[2] >> 4; cz++) {
+                    Chunk chunk = world.getChunkAt(cx, cz);
+                    chunk.addPluginChunkTicket(this);
+                    releaseChunkTicketSoon(chunk);
+                }
+                sender.sendMessage(toJson(Map.of("ok", others.isEmpty(), "other_players", others)));
+                return true;
+            }
+            long volume = (long)(max[0] - min[0] + 1) * (max[1] - min[1] + 1) * (max[2] - min[2] + 1);
+            if (volume > 4096 || max[0] - min[0] > 47 || max[1] - min[1] > 47 || max[2] - min[2] > 47 || min[1] < world.getMinHeight() || max[1] >= world.getMaxHeight()) throw new IllegalArgumentException("footprint_limit_4096_blocks_48_per_axis");
+            Map<String, Integer> materials = new LinkedHashMap<>();
+            int liquids = 0, occupied = 0, containers = 0;
+            List<Chunk> tickets = scanChunkTickets(world, (min[0] + max[0]) / 2, (min[2] + max[2]) / 2, Math.max(max[0] - min[0], max[2] - min[2]) + 1);
+            try {
+                for (int x = min[0]; x <= max[0]; x++) for (int y = min[1]; y <= max[1]; y++) for (int z = min[2]; z <= max[2]; z++) {
+                    Block block = world.getBlockAt(x, y, z);
+                    materials.merge(block.getType().getKey().toString(), 1, Integer::sum);
+                    if (!block.getType().isAir()) occupied++;
+                    if (block.isLiquid()) liquids++;
+                    if (block.getState() instanceof org.bukkit.block.Container) containers++;
+                }
+            } finally { for (Chunk chunk : tickets) releaseChunkTicketSoon(chunk); }
+            sender.sendMessage(toJson(Map.of("ok", true, "dimension", world.getKey().toString(), "volume", volume, "occupied", occupied, "liquids", liquids, "containers", containers, "materials", materials, "players", others)));
+        } catch (IllegalArgumentException error) {
+            sender.sendMessage(toJson(Map.of("ok", false, "error", error.getMessage())));
+        }
         return true;
     }
 
@@ -392,7 +538,7 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
                 Block block = world.getBlockAt(x, y, z);
                 sender.sendMessage(toJson(blockDescription(world, block, x, y, z)));
             } finally {
-                chunk.removePluginChunkTicket(this);
+                releaseChunkTicketSoon(chunk);
             }
         } catch (NumberFormatException exception) {
             sender.sendMessage("{\"error\":\"coordinates_must_be_integers\"}");
@@ -422,7 +568,7 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
                 sender.sendMessage(toJson(sceneScan(world, location, null, radius, vertical)));
             } finally {
                 for (Chunk chunk : tickets) {
-                    chunk.removePluginChunkTicket(this);
+                    releaseChunkTicketSoon(chunk);
                 }
             }
         } catch (NumberFormatException exception) {
@@ -461,6 +607,17 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
             }
         }
         return chunks;
+    }
+
+    private void releaseChunkTicketSoon(Chunk chunk) {
+        long expiry = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+        ticketExpiry.put(chunk, expiry);
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (ticketExpiry.getOrDefault(chunk, 0L) == expiry) {
+                ticketExpiry.remove(chunk);
+                chunk.removePluginChunkTicket(this);
+            }
+        }, 100L);
     }
 
     private Map<String, Object> blockDescription(World world, Block block, int x, int y, int z) {
@@ -578,27 +735,11 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
     }
 
     private Map<String, Object> event(String type, Map<String, ?> data) {
-        Map<String, Object> event = new HashMap<>();
-        event.put("type", type);
-        event.put("source", "paper");
-        event.putAll(data);
-        return event;
+        return EventPayload.create(type, data);
     }
 
     private void sendEvent(Map<String, Object> event) {
-        String body = toJson(event);
-        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(bridgeUrl))
-                .timeout(Duration.ofSeconds(3))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(body));
-        if (!bridgeToken.isBlank()) {
-            request.header("Authorization", "Bearer " + bridgeToken);
-        }
-        http.sendAsync(request.build(), HttpResponse.BodyHandlers.discarding())
-                .exceptionally(error -> {
-                    getLogger().fine("Could not send event to bridge: " + error.getMessage());
-                    return null;
-                });
+        outbox.enqueue(toJson(event));
     }
 
     private static String position(Location location) {
@@ -609,30 +750,6 @@ public final class MinecraftGodPlugin extends JavaPlugin implements Listener, Co
         return Math.round(value * 100.0) / 100.0;
     }
 
-    private static String toJson(Object value) {
-        if (value == null) return "null";
-        if (value instanceof String string) return "\"" + escape(string) + "\"";
-        if (value instanceof Number || value instanceof Boolean) return value.toString();
-        if (value instanceof Map<?, ?> map) {
-            return map.entrySet().stream()
-                    .map(entry -> toJson(String.valueOf(entry.getKey())) + ":" + toJson(entry.getValue()))
-                    .collect(Collectors.joining(",", "{", "}"));
-        }
-        if (value instanceof Iterable<?> iterable) {
-            List<String> values = new ArrayList<>();
-            iterable.forEach(item -> values.add(toJson(item)));
-            return String.join(",", values).transform(text -> "[" + text + "]");
-        }
-        return toJson(String.valueOf(value));
-    }
-
-    private static String escape(String value) {
-        return value.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\b", "\\b")
-                .replace("\f", "\\f")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
-    }
+    private static String toJson(Object value) { return EventPayload.toJson(value); }
+    private static String escape(String value) { return EventPayload.escape(value); }
 }

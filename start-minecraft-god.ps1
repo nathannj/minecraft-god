@@ -16,19 +16,16 @@ if (-not (Test-Path $eulaFile) -or -not ((Get-Content -Raw -LiteralPath $eulaFil
 $javaExe = if (Test-Path $javaPathFile) { (Get-Content -Raw -LiteralPath $javaPathFile).Trim() } else { (Get-Command java).Source }
 if (-not (Test-Path $javaExe)) { throw "The configured Java runtime was not found. Run setup again." }
 
-$env:MINECRAFT_RCON_PASSWORD_FILE = Join-Path $ServerDir "rcon-password.txt"
-$env:MINECRAFT_PLAYER = (Get-Content -Raw -LiteralPath (Join-Path $ServerDir "god-player.txt")).Trim()
-$env:MINECRAFT_EVENTS_FILE = Join-Path $Root "state\events.jsonl"
-$env:MINECRAFT_LEDGER_FILE = Join-Path $Root "state\god_ledger.sqlite3"
-$env:MINECRAFT_PROFILE_DIR = Join-Path $Root "state\players"
-$env:MINECRAFT_MAX_GODS = "32"
-$env:MINECRAFT_GOD_IDLE_SECONDS = "120"
-$env:MINECRAFT_GOD_STORY_INTERVAL_SECONDS = "180"
-$env:MINECRAFT_GOD_MAX_THREAD_TURNS = "12"
-$env:MINECRAFT_GOD_LOG_MAX_BYTES = "26214400"
-$env:MINECRAFT_EVENT_BASE_URL = "http://127.0.0.1:8765"
-$npmCodex = Join-Path $env:APPDATA "npm\codex.cmd"
-if (Test-Path $npmCodex) { $env:CODEX_CLI_PATH = $npmCodex }
+. (Join-Path $Root "scripts\runtime.ps1")
+Initialize-GodEnvironment
+& py -3 -m god_bridge.codex_runtime status
+if ($LASTEXITCODE -ne 0) { throw "Sign in to the dedicated game runtime: py -3 -m god_bridge.codex_runtime login" }
+if (-not (Test-Path -LiteralPath $env:MINECRAFT_EVENT_TOKEN_FILE)) { throw "Event token is missing. Run setup again." }
+$existing = @(Get-CimInstance Win32_Process | Where-Object {
+    $_.ProcessId -ne $PID -and (Test-ProjectRuntimeProcess $_) -and $_.CommandLine -match 'run_controller.py|run_event_hub.py|paper.jar'
+})
+if ($existing) { throw "This project's runtime is already running. Use the stop or restart script first." }
+New-Item -ItemType Directory -Force -Path (Join-Path $Root "logs") | Out-Null
 $readyFile = Join-Path $Root "logs\god-controller.ready"
 Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue
 $env:MINECRAFT_GOD_READY_FILE = $readyFile
@@ -39,15 +36,23 @@ $hubErr = Join-Path $Root "logs\event-hub.err.log"
 $godOut = Join-Path $Root "logs\god-controller.out.log"
 $godErr = Join-Path $Root "logs\god-controller.err.log"
 
-$hub = Start-Process -FilePath (Get-Command py).Source -ArgumentList @("-3", "-m", "god_bridge.event_hub") -WorkingDirectory $Root -WindowStyle Hidden -RedirectStandardOutput $hubOut -RedirectStandardError $hubErr -PassThru
+$hubPython = (Get-Command py).Source
+$hubArguments = @("-3", ('"' + (Join-Path $Root "run_event_hub.py") + '"'))
+if ($env:MINECRAFT_VOICE_ENABLED -eq '1') {
+    $hubPython = Join-Path $Root '.tools/voice-venv/Scripts/python.exe'
+    if (-not (Test-Path -LiteralPath $hubPython)) { throw 'Run .\setup-multiplayer.ps1 to install local speech recognition.' }
+    $hubArguments = @(('"' + (Join-Path $Root "run_event_hub.py") + '"'))
+}
+$hub = Start-Process -FilePath $hubPython -ArgumentList $hubArguments -WorkingDirectory $Root -WindowStyle Hidden -RedirectStandardOutput $hubOut -RedirectStandardError $hubErr -PassThru
 try {
     $ready = $false
     for ($i = 0; $i -lt 40; $i++) {
+        if ($hub.HasExited) { throw "The event hub stopped. Check logs\event-hub.err.log." }
         try { Invoke-WebRequest -Uri "http://127.0.0.1:8765/healthz" -UseBasicParsing -TimeoutSec 1 | Out-Null; $ready = $true; break } catch { Start-Sleep -Milliseconds 250 }
     }
     if (-not $ready) { throw "The event hub did not start. Check logs\event-hub.err.log." }
 
-    $controller = Start-Process -FilePath (Get-Command py).Source -ArgumentList @("-3", "-m", "god_bridge.controller") -WorkingDirectory $Root -WindowStyle Hidden -RedirectStandardOutput $godOut -RedirectStandardError $godErr -PassThru
+    $controller = Start-Process -FilePath (Get-Command py).Source -ArgumentList @("-3", ('"' + (Join-Path $Root "run_controller.py") + '"')) -WorkingDirectory $Root -WindowStyle Hidden -RedirectStandardOutput $godOut -RedirectStandardError $godErr -PassThru
     try {
         $godReady = $false
         for ($i = 0; $i -lt 180; $i++) {
@@ -58,15 +63,15 @@ try {
         if (-not $godReady) { throw "The god controller did not become ready. Check logs\god-controller.err.log." }
         Write-Host "God controller is waiting for players to join. Each player receives a persistent personal god."
         Write-Host "Starting Paper server. Connect from Minecraft Java Edition to localhost:25565."
-        & $javaExe -Xms4G -Xmx4G -jar $paperJar --nogui
+        & $javaExe "-Xms$env:MINECRAFT_JAVA_MIN_MEMORY" "-Xmx$env:MINECRAFT_JAVA_MAX_MEMORY" -jar $paperJar --nogui
     } finally {
-        if ($controller -and -not $controller.HasExited) { Stop-Process -Id $controller.Id -Force -ErrorAction SilentlyContinue }
+        if ($controller -and -not $controller.HasExited) { & taskkill.exe /PID $controller.Id /T /F 2>$null | Out-Null }
         # Also clean up a controller that may have been restarted independently
         # while this launcher kept the Paper server alive.
         Get-CimInstance Win32_Process | Where-Object {
-            $_.CommandLine -match 'god_bridge\.controller' -and $_.CommandLine -match 'python|py\.exe'
+            (Test-ProjectRuntimeProcess $_) -and $_.CommandLine -match 'run_controller.py'
         } | ForEach-Object { & taskkill.exe /PID $_.ProcessId /T /F | Out-Null }
     }
 } finally {
-    if ($hub -and -not $hub.HasExited) { Stop-Process -Id $hub.Id -Force -ErrorAction SilentlyContinue }
+    if ($hub -and -not $hub.HasExited) { & taskkill.exe /PID $hub.Id /T /F 2>$null | Out-Null }
 }

@@ -13,14 +13,14 @@ import math
 import os
 import re
 import sys
-import threading
+import time
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 from typing import Any
 
 from .bridge import BridgeConfig, GodBridge, parse_identifier, parse_position
+from .event_http import EventHandler as EventHandler, start_event_server
+from .runtime import event_token
 
 
 SIGN_MAX_LINES = 4
@@ -61,7 +61,14 @@ def sign_line_width(text: str) -> int:
 
 
 def tool_definitions() -> list[dict[str, Any]]:
-    return [
+    definitions = [
+        {"name": "find_safe_surface", "description": "Find safe ground above the owned player's current column in one server operation; use for a bounded surface rescue.", "inputSchema": {"type": "object", "properties": {}}},
+        {"name": "inspect_footprint", "description": "Summarize a build footprint, materials, liquids, containers and players in one operation. Maximum 4096 blocks and 48 per axis.", "inputSchema": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "dimension": {"type": "string"}}, "required": ["from", "to", "dimension"]}},
+        {"name": "propose_agreement", "description": "Propose durable treaty terms, shared landmark, joint expedition or feud to participating gods. All must accept. Supersedes names an active agreement to revise; the old terms remain active until acceptance.", "inputSchema": {"type": "object", "properties": {"subject": {"type": "string"}, "participants": {"type": "array", "items": {"type": "string"}}, "terms": {"type": "object"}, "kind": {"type": "string", "enum": ["treaty", "shared_landmark", "joint_expedition", "feud"], "default": "treaty"}, "supersedes": {"type": "string"}}, "required": ["subject", "participants", "terms"]}},
+        {"name": "respond_agreement", "description": "Accept or decline a structured agreement as one of its participants.", "inputSchema": {"type": "object", "properties": {"agreement_id": {"type": "string"}, "decision": {"type": "string", "enum": ["accept", "decline"]}}, "required": ["agreement_id", "decision"]}},
+        {"name": "list_agreements", "description": "Read the shared authoritative agreements and proposed revisions involving your god.", "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "default": ""}}}},
+        {"name": "record_player_choice", "description": "Record an evidenced interpretation: progress, preparation, incidental activity, refusal, abandonment, or a creative alternative. Incidental gathering is not refusal.", "inputSchema": {"type": "object", "properties": {"choice": {"type": "string"}, "evidence": {"type": "string"}, "objective_id": {"type": "string"}, "approach": {"type": "string", "enum": ["progress", "preparation", "incidental", "refusal", "abandonment", "alternative"]}}, "required": ["choice", "evidence", "approach"]}},
+        {"name": "revise_story_objective", "description": "Accept a negotiated alternative or change a test, preserving why it changed and registering the new physical completion condition.", "inputSchema": {"type": "object", "properties": {"objective_id": {"type": "string"}, "reason": {"type": "string"}, "objective": {"type": "object"}}, "required": ["objective_id", "reason", "objective"]}},
         {"name": "observe_world", "description": "Observe compact live player telemetry, persistent landmarks, objectives, and recent meaningful story context. Use this at the beginning of every decision.", "inputSchema": {"type": "object", "properties": {"include_scene": {"type": "boolean", "default": False}}}},
         {"name": "observe_location", "description": "Observe a remembered landmark remotely without moving or notifying the player. Use named spatial memory instead of assuming the player's current location is the requested place.", "inputSchema": {"type": "object", "properties": {"landmark_id": {"type": "string"}, "radius": {"type": "integer", "minimum": 1, "maximum": 24, "default": 12}, "vertical_radius": {"type": "integer", "minimum": 1, "maximum": 16, "default": 8}, "include_scene": {"type": "boolean", "default": True}}, "required": ["landmark_id"]}},
         {"name": "inspect_area", "description": "Inspect the exact local area around the player. Prefer inspect_area_at or observe_location for a named destination elsewhere.", "inputSchema": {"type": "object", "properties": {"radius": {"type": "integer", "minimum": 1, "maximum": 24, "default": 8}, "vertical_radius": {"type": "integer", "minimum": 1, "maximum": 16, "default": 5}}}},
@@ -84,8 +91,8 @@ def tool_definitions() -> list[dict[str, Any]]:
         {"name": "complete_story_objective", "description": "Resolve an objective and remove its promise and watch after verified fulfillment, failure, or abandonment.", "inputSchema": {"type": "object", "properties": {"objective_id": {"type": "string"}, "outcome": {"type": "string", "enum": ["fulfilled", "failed", "abandoned"], "default": "fulfilled"}}, "required": ["objective_id"]}},
         {"name": "register_story_watch", "description": "Register a deterministic wake condition. Kinds include event, region, item, block actions, health, mob kill, structure_change, and composite all/any conditions. Prefer set_story_objective for player-facing tests.", "inputSchema": {"type": "object", "properties": {"watch": {"type": "object"}}, "required": ["watch"]}},
         {"name": "clear_story_watch", "description": "Remove a resolved or abandoned story watch by id.", "inputSchema": {"type": "object", "properties": {"watch_id": {"type": "string"}}, "required": ["watch_id"]}},
-        {"name": "preflight_command", "description": "Run cheap non-mutating validation for a raw Minecraft command before executing it. This checks ownership scope, command shape, and known sign limits without contacting the server.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string", "minLength": 1}}, "required": ["command"]}},
-        {"name": "minecraft_command", "description": "Execute an arbitrary Minecraft server command through local RCON after bridge preflight validation. Do not include the leading slash. RCON is the server console; set relative_to_player=true when using ~ coordinates near the player. Reuse idempotency_key when retrying the same intended action.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string", "minLength": 1}, "relative_to_player": {"type": "boolean", "default": False}, "idempotency_key": {"type": "string", "maxLength": 128}}, "required": ["command"]}},
+        {"name": "preflight_command", "description": "Validate a supported raw command without executing its mutation. Checks scope, command shape and sign limits; world actions also query the live dimension and bystanders.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string", "minLength": 1}}, "required": ["command"]}},
+        {"name": "minecraft_command", "description": "Execute a supported command through RCON after ownership and protected-region checks. Unknown commands and unsafe wrappers are rejected for player gods. Do not include the leading slash. Set relative_to_player=true for ~ coordinates near the player, and reuse idempotency_key for retries. Use typed place_structure for templates.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string", "minLength": 1}, "relative_to_player": {"type": "boolean", "default": False}, "idempotency_key": {"type": "string", "maxLength": 128}}, "required": ["command"]}},
         {"name": "god_say", "description": "Speak privately to your own player. This is the default and normal way for a god to communicate; the message is not shown to other players. (Legacy name retained.)", "inputSchema": {"type": "object", "properties": {"message": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["message"]}},
         {"name": "whisper_player", "description": "Speak privately to your own player. The message is not shown to other players.", "inputSchema": {"type": "object", "properties": {"message": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["message"]}},
         {"name": "broadcast_to_world", "description": "Make a rare public announcement to every online player. Use only when the story truly requires a world-wide proclamation; it is automatically attributed as [God of <your player>] so the audience knows which god is speaking.", "inputSchema": {"type": "object", "properties": {"message": {"type": "string", "minLength": 1, "maxLength": 256}}, "required": ["message"]}},
@@ -108,9 +115,49 @@ def tool_definitions() -> list[dict[str, Any]]:
         {"name": "fill", "description": "Fill a cuboid, optionally in a remote dimension. Prefer a small number of coherent fills followed by remote verification.", "inputSchema": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "block": {"type": "string"}, "dimension": {"type": "string", "default": ""}, "mode": {"type": "string", "enum": ["replace", "destroy", "hollow", "outline", "keep"], "default": "replace"}}, "required": ["from", "to", "block"]}},
         {"name": "place_structure", "description": "Place a structure at exact coordinates, optionally in a remote dimension, with preview and representative-block verification.", "inputSchema": {"type": "object", "properties": {"structure": {"type": "string"}, "position": {"type": "string"}, "dimension": {"type": "string", "default": ""}, "rotation": {"type": "string", "enum": ["none", "clockwise_90", "clockwise_180", "counterclockwise_90"], "default": "none"}, "preview": {"type": "boolean", "default": False}, "idempotency_key": {"type": "string", "maxLength": 128}}, "required": ["structure", "position"]}},
     ]
+    for tool in definitions:
+        if tool["name"] in {"set_block", "fill", "place_structure"}:
+            tool["inputSchema"]["properties"]["landmark_id"] = {"type": "string", "description": "For a named building, verify absolute coordinates against this landmark's bounds and dimension."}
+        if tool["name"] in {"spawn_entity", "move_entity_to_block", "place_sign", "give_item", "set_block", "fill", "set_weather", "set_time", "teleport", "effect"}:
+            tool["inputSchema"]["properties"]["idempotency_key"] = {"type": "string", "maxLength": 128}
+    return definitions
 
 
 def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
+    powers = {"minecraft_command", "import_structure", "god_say", "whisper_player", "broadcast_to_world", "send_god_message", "use_intervention", "punish_player", "spawn_entity", "place_entity_on_block", "move_entity_to_block", "place_sign", "give_item", "set_weather", "set_time", "teleport", "effect", "set_block", "fill", "place_structure"}
+    context = bridge._turn_context()
+    if name in powers and (context.get("status") in {"interrupted", "expired"} or context.get("deadline_epoch", float("inf")) <= time.time()):
+        raise PermissionError("this decision was interrupted or expired; preserve unfinished work and await the next trigger")
+    if args.get("landmark_id") and name in {"set_block", "fill", "place_structure"}:
+        args = dict(args)
+        landmark = bridge.observe_location(args["landmark_id"], include_scene=False)["landmark"]
+        if args.get("dimension") and args["dimension"] != landmark["dimension"]:
+            raise ValueError("action dimension conflicts with its named landmark")
+        bounds = landmark.get("bounds")
+        if not bounds:
+            raise ValueError("record verified building bounds before using a named action")
+        from .authority import contains
+        from .bridge import absolute_block_position
+        fields = ["from", "to"] if name == "fill" else ["position"]
+        for field in fields:
+            point = absolute_block_position(args[field])
+            if not contains(bounds, {"min": point, "max": point}):
+                raise ValueError("action coordinates are outside its named landmark")
+        args["dimension"] = landmark["dimension"]
+    if name == "find_safe_surface":
+        return bridge.find_safe_surface()
+    if name == "inspect_footprint":
+        return bridge.inspect_footprint(args["from"], args["to"], args["dimension"])
+    if name == "propose_agreement":
+        return bridge.propose_agreement(args["subject"], args["participants"], args["terms"], args.get("kind", "treaty"), args.get("supersedes", ""))
+    if name == "respond_agreement":
+        return bridge.respond_agreement(args["agreement_id"], args["decision"])
+    if name == "list_agreements":
+        return {"ok": True, "agreements": bridge._ledger.agreements_for(bridge._require_owner(), args.get("status", ""))}
+    if name == "record_player_choice":
+        return bridge.record_player_choice(args["choice"], args["evidence"], args.get("objective_id", ""), args.get("approach", "preparation"))
+    if name == "revise_story_objective":
+        return bridge.revise_story_objective(args["objective_id"], args["reason"], args["objective"])
     if name == "observe_world":
         return bridge.observe_world(bool(args.get("include_scene", False)))
     if name == "observe_location":
@@ -162,6 +209,8 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         return bridge.clear_story_watch(args["watch_id"])
     if name == "minecraft_command":
         command = args["command"]
+        if bridge.owner_id and re.search(r"\bplace\s+template\b", command):
+            raise PermissionError("use place_structure so its full protected footprint can be checked")
         if args.get("relative_to_player", False):
             command = bridge.command_at_player(command)
         preflight = bridge.preflight_command(command)
@@ -201,11 +250,19 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         nbt = args.get("nbt", "")
         if not isinstance(nbt, str) or any(c in nbt for c in "\r\n\x00"):
             raise ValueError("nbt must be a single-line string")
+        if bridge.owner_id:
+            if re.search(r"\bTags\s*:", nbt):
+                raise ValueError("entity tags are assigned by the ownership tool")
+            tag = bridge.reserve_entity_tag("", str(args.get("idempotency_key", "")))
+            nbt = "{" + f"Tags:['{tag}']" + ("," + nbt.strip().removeprefix("{").removesuffix("}") if nbt.strip() else "") + "}"
         suffix = f" {nbt.strip()}" if nbt.strip() else ""
         command = f"summon {entity} {position}{suffix}"
-        if "~" in position:
+        if bridge.owner_id or "~" in position:
             command = bridge.command_at_player(command)
-        return bridge.action("spawn_entity", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
+        result = bridge.action("spawn_entity", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
+        if bridge.owner_id:
+            result["tag"] = tag
+        return result
     if name == "place_entity_on_block":
         entity = parse_identifier(args["entity_type"], "entity_type")
         support_block = parse_identifier(args["support_block"], "support_block")
@@ -220,6 +277,10 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         extra = args.get("nbt", "")
         if not isinstance(extra, str) or any(c in extra for c in "\r\n\x00"):
             raise ValueError("nbt must be a single-line string")
+        if bridge.owner_id:
+            if re.search(r"\bTags\s*:", extra):
+                raise ValueError("entity tags are assigned by the ownership tool")
+            tag = bridge.reserve_entity_tag(str(args.get("tag", "")), str(args.get("idempotency_key", "")))
         custom_name = json.dumps({"text": entity_name, "color": color}, separators=(",", ":"))
         custom_name = custom_name.replace("'", "\\'")
         nbt_parts = [f"CustomName:'{custom_name}'", f"Tags:['{tag}']", "PersistenceRequired:1b"]
@@ -229,8 +290,11 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
             nbt_parts.append(extra.strip().removeprefix("{").removesuffix("}"))
         x, y, z = block_position
         command = f"execute if block {x} {y} {z} {support_block} if block {x} {y + 1} {z} air if block {x} {y + 2} {z} air run summon {entity} {x}.5 {y + 1}.0 {z}.5 {{{','.join(nbt_parts)}}}"
+        if bridge.owner_id:
+            command = bridge.command_at_player(command)
         result = bridge.action("place_entity_on_block", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
-        verification = bridge.execute(f"data get entity @e[tag={tag},limit=1] Pos", record=False)
+        verification_command = f"data get entity @e[tag={tag},limit=1] Pos"
+        verification = bridge.execute(bridge.command_at_player(verification_command) if bridge.owner_id else verification_command, record=False)
         result["tag"] = tag
         result["support_block"] = f"{support_block} at {x} {y} {z}"
         result["verification"] = verification
@@ -243,8 +307,11 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         support_block = parse_identifier(args["support_block"], "support_block")
         x, y, z = bridge.resolve_block_position(args["block_position"])
         command = f"execute if block {x} {y} {z} {support_block} if block {x} {y + 1} {z} air if block {x} {y + 2} {z} air run tp @e[tag={tag},limit=1] {x}.5 {y + 1}.0 {z}.5"
-        result = bridge.action("move_entity_to_block", lambda: command)
-        verification = bridge.execute(f"data get entity @e[tag={tag},limit=1] Pos", record=False)
+        if bridge.owner_id:
+            command = bridge.command_at_player(command)
+        result = bridge.action("move_entity_to_block", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
+        verification_command = f"data get entity @e[tag={tag},limit=1] Pos"
+        verification = bridge.execute(bridge.command_at_player(verification_command) if bridge.owner_id else verification_command, record=False)
         result["verification"] = verification
         result["ok"] = bool(result.get("ok") and verification.get("ok") and _position_matches(verification.get("output", ""), (x + 0.5, y + 1.0, z + 0.5)))
         return result
@@ -273,11 +340,11 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         glowing = "1b" if args.get("glowing", False) else "0b"
         block = f"{material}[rotation={rotation}]{{front_text:{{messages:[{front}],color:'{color}',has_glowing_text:{glowing}}}}}"
         command = f"setblock {position} {block}"
-        if "~" in position:
+        if bridge.owner_id or "~" in position:
             command = bridge.command_at_player(command)
         result = bridge.action("place_sign", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
         verify_command = f"data get block {position} front_text.messages"
-        if "~" in position:
+        if bridge.owner_id or "~" in position:
             verify_command = bridge.command_at_player(verify_command)
         verification = bridge.execute(verify_command, record=False)
         result["verification"] = verification
@@ -299,10 +366,10 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
         duration = max(1, min(int(args.get("duration", 600)), 100000))
         return bridge.action("set_weather", lambda: f"weather {weather} {duration}", idempotency_key=str(args.get("idempotency_key", "") or ""))
     if name == "set_time":
-        time = str(args["time"]).strip()
-        if not time or len(time) > 30 or not all(c.isalnum() or c in "~+-" for c in time):
+        time_value = str(args["time"]).strip()
+        if not time_value or len(time_value) > 30 or not all(c.isalnum() or c in "~+-" for c in time_value):
             raise ValueError("time must be a Minecraft time token")
-        return bridge.action("set_time", lambda: f"time set {time}", idempotency_key=str(args.get("idempotency_key", "") or ""))
+        return bridge.action("set_time", lambda: f"time set {time_value}", idempotency_key=str(args.get("idempotency_key", "") or ""))
     if name == "teleport":
         target = bridge.current_player_name()
         if bridge.owner_id:
@@ -319,7 +386,7 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
             command = f"execute in {dimension} run tp {target} {position}"
         else:
             command = f"tp {target} {position}"
-        if "~" in position:
+        if (bridge.owner_id and not dimension) or "~" in position:
             command = bridge.command_at_player(command)
         result = bridge.action("teleport", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
         result["preflight"] = preflight
@@ -344,7 +411,7 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
             if "~" in position:
                 raise ValueError("remote dimension block placement requires absolute coordinates")
             command = f"execute in {dimension} run {command}"
-        elif "~" in position:
+        elif bridge.owner_id or "~" in position:
             command = bridge.command_at_player(command)
         return bridge.action("set_block", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
     if name == "fill":
@@ -361,7 +428,7 @@ def call_tool(bridge: GodBridge, name: str, args: dict[str, Any]) -> Any:
             if "~" in from_pos or "~" in to_pos:
                 raise ValueError("remote dimension fills require absolute coordinates")
             command = f"execute in {dimension} run {command}"
-        elif "~" in from_pos or "~" in to_pos:
+        elif bridge.owner_id or "~" in from_pos or "~" in to_pos:
             command = bridge.command_at_player(command)
         return bridge.action("fill", lambda: command, idempotency_key=str(args.get("idempotency_key", "") or ""))
     if name == "place_structure":
@@ -406,6 +473,9 @@ def handle_request(bridge: GodBridge, request: dict[str, Any]) -> dict[str, Any]
         return {"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "minecraft-god-bridge", "version": "0.1.0"}}}
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": tool_definitions()}}
+    if method in {"resources/list", "resources/templates/list", "prompts/list"}:
+        key = {"resources/list": "resources", "resources/templates/list": "resourceTemplates", "prompts/list": "prompts"}[method]
+        return {"jsonrpc": "2.0", "id": request_id, "result": {key: []}}
     if method == "tools/call":
         params = request.get("params") or {}
         name = params.get("name")
@@ -419,75 +489,8 @@ def handle_request(bridge: GodBridge, request: dict[str, Any]) -> dict[str, Any]
                     content.append({"type": "image", "data": base64.b64encode(image_path.read_bytes()).decode("ascii"), "mimeType": "image/png"})
             return {"jsonrpc": "2.0", "id": request_id, "result": {"content": content, "structuredContent": result}}
         except Exception as exc:
-            return {"jsonrpc": "2.0", "id": request_id, "result": {"isError": True, "content": [{"type": "text", "text": str(exc)}]}}
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"isError": True, "structuredContent": {"ok": False, "error": str(exc), "error_type": type(exc).__name__, "tool": name}, "content": [{"type": "text", "text": str(exc)}]}}
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
-
-
-class EventHandler(BaseHTTPRequestHandler):
-    bridge: GodBridge
-
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path == "/healthz":
-            self._send_json(200, {"ok": True, "service": "minecraft-god-bridge"})
-            return
-        if parsed.path == "/events":
-            query = parse_qs(parsed.query)
-            try:
-                after = int(query.get("after", ["0"])[0])
-                limit = int(query.get("limit", ["100"])[0])
-            except ValueError:
-                self.send_error(400, "after and limit must be integers")
-                return
-            self._send_json(200, {"events": self.bridge.events_since(after, limit), "latest": self.bridge.latest_event_id()})
-            return
-        if parsed.path != "/healthz":
-            self.send_error(404)
-            return
-
-    def do_POST(self) -> None:
-        if self.path != "/events":
-            self.send_error(404)
-            return
-        expected = self.bridge.config.event_token
-        if expected and self.headers.get("Authorization") != f"Bearer {expected}":
-            self.send_error(401)
-            return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length > 1_000_000:
-                raise ValueError("event body is too large")
-            payload = json.loads(self.rfile.read(length))
-            if not isinstance(payload, dict):
-                raise ValueError("event payload must be an object")
-            event = self.bridge.record_event(payload)
-            self._send_json(202, {"ok": True, "event": event})
-        except (ValueError, json.JSONDecodeError) as exc:
-            self.send_error(400, str(exc))
-
-    def log_message(self, format: str, *args: Any) -> None:
-        message = format % args
-        # The controller polls /events while it waits for the next trigger.
-        # Successful empty polls are expected and otherwise drown useful
-        # POST/error entries in event-hub.err.log.
-        if args and len(args) >= 2 and str(args[0]).startswith("GET /events") and str(args[1]) == "200":
-            return
-        print(f"[event-http] {message}", file=sys.stderr)
-
-    def _send_json(self, status: int, body: dict[str, Any]) -> None:
-        encoded = json.dumps(body).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
-
-
-def start_event_server(bridge: GodBridge) -> ThreadingHTTPServer:
-    handler = type("ConfiguredEventHandler", (EventHandler,), {"bridge": bridge})
-    server = ThreadingHTTPServer((bridge.config.event_host, bridge.config.event_port), handler)
-    threading.Thread(target=server.serve_forever, name="minecraft-event-http", daemon=True).start()
-    return server
 
 
 def config_from_env(config_file: str | None = None) -> BridgeConfig:
@@ -537,6 +540,8 @@ def config_from_env(config_file: str | None = None) -> BridgeConfig:
     password_file = os.getenv("MINECRAFT_RCON_PASSWORD_FILE")
     if not config.rcon_password and password_file:
         config.rcon_password = Path(password_file).read_text(encoding="utf-8").strip()
+    if not config.event_token:
+        config.event_token = event_token()
     return config
 
 

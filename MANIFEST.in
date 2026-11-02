@@ -1,0 +1,14 @@
+include README.md LICENSE THIRD_PARTY_NOTICES.md CONTRIBUTING.md SECURITY.md CHANGELOG.md
+include versions.lock.json config.example.json
+include *.ps1 *.cmd run_*.py
+recursive-include docs *.md
+recursive-include templates *.yml *.properties
+recursive-include third_party *.txt
+recursive-include tests *.py
+recursive-include scripts *.py *.ps1
+include paper-plugin/gradlew paper-plugin/gradlew.bat
+include paper-plugin/gradle/wrapper/gradle-wrapper.jar
+recursive-include paper-plugin *.java *.kts *.yml *.properties
+prune paper-plugin/build
+prune paper-plugin/.gradle
+global-exclude __pycache__ *.pyc

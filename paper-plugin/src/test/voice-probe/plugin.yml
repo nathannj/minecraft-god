@@ -1,0 +1,5 @@
+name: VoiceProbe
+version: '1.0'
+main: com.minecraftgod.bridge.VoiceProbePlugin
+api-version: '26.2'
+depend: [MinecraftGodBridge, voicechat]

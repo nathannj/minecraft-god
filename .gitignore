@@ -32,6 +32,14 @@ paper-plugin/build/
 camera/node_modules/
 camera/renders/
 camera/output/
+client/
+dist/
+build/
+*.egg-info/
+.coverage
+htmlcov/
+.codex-runtime/
+!paper-plugin/gradle/wrapper/gradle-wrapper.jar
 
 # Local/runtime server files
 eula.txt

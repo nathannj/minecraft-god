@@ -1,3 +1,8 @@
 bridge-url: "http://127.0.0.1:8765/events"
 bridge-token: ""
+prayer-cooldown-seconds: 10
 player-name: ""
+voice-transcription:
+  enabled: true
+  default-enabled: true
+  nearby-radius: 64

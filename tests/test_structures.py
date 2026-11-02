@@ -33,7 +33,7 @@ def _structure_nbt() -> bytes:
 def test_structure_nbt_metadata_is_read_without_external_dependencies(tmp_path: Path):
     path = tmp_path / "altar.nbt"
     path.write_bytes(_structure_nbt())
-    assert read_structure_metadata(path) == {"size": [4, 5, 6], "samples": [{"position": [1, 2, 3], "block": "minecraft:stone"}]}
+    assert read_structure_metadata(path) == {"size": [4, 5, 6], "samples": [{"position": [1, 2, 3], "block": "minecraft:stone"}], "scoped_safe": True, "entity_count": 0}
 
 
 def test_structure_zip_import_extracts_only_nbt_templates(tmp_path: Path):
@@ -49,7 +49,7 @@ def test_structure_zip_import_extracts_only_nbt_templates(tmp_path: Path):
     entries, _ = library._extract_structures(source, target, "god_demo")
 
     assert entries[0]["id"] == "god_demo:altar"
-    assert (target / "data/god_demo/structures/altar.nbt").is_file()
+    assert (target / "data/god_demo/structure/altar.nbt").is_file()
     assert not (target / "data/demo/function/dangerous.mcfunction").exists()
 
 
@@ -68,6 +68,11 @@ def test_imported_structure_placement_checks_a_representative_block(tmp_path: Pa
 
         def command(self, command):
             self.commands.append(command)
+            if command.startswith("godobserve "):
+                return type("Response", (), {"body": '{"ok":true,"dimension":"minecraft:overworld"}'})()
+            if command.startswith("godcheckbatch "):
+                results = [{"ok": True, "block": {"type": "minecraft:stone" if point == "11,22,33" else "minecraft:air", "liquid": False, "solid": point == "11,22,33"}} for point in command.split()[2:]]
+                return type("Response", (), {"body": json.dumps({"ok": True, "results": results})})()
             if command.startswith("godcheck "):
                 block_type = "minecraft:stone" if command.endswith(" 11 22 33") else "minecraft:air"
                 return type("Response", (), {"body": json.dumps({

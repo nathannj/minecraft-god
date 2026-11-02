@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import queue
-import shutil
 import subprocess
 import sys
 import threading
@@ -19,11 +18,16 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .ledger import GodLedger
-from .story import classify_event, coalesce_events, compact_event, event_targets, story_is_active, watch_deadline_due, watch_matches
+from .story import activity_changes, classify_event, coalesce_events, compact_event, event_priority, event_targets, story_is_active, watch_deadline_due, watch_matches
+from .state_lock import ProfileLock
 
 
-ROOT = Path(__file__).resolve().parents[1]
-GOD_PROMPT = (ROOT / "prompts" / "god_system.md").read_text(encoding="utf-8")
+from importlib.resources import files
+from .runtime import event_token, player_id as validate_player_id, profile_path, workspace_root
+from .codex_runtime import codex_binary, check_version, runtime_environment, verify_mcp_inventory
+
+ROOT = workspace_root()
+GOD_PROMPT = files("god_bridge").joinpath("god_system.md").read_text(encoding="utf-8")
 
 
 class ControllerAlreadyRunning(RuntimeError):
@@ -157,11 +161,13 @@ class Transcript:
 
     @classmethod
     def _bounded(cls, value: Any, depth: int = 0) -> Any:
-        if depth >= 6:
+        if depth >= 12:
             return "<depth limit>"
         if isinstance(value, str):
-            return value if len(value) <= 4000 else value[:4000] + f"… <{len(value) - 4000} chars omitted>"
+            return value if len(value) <= 4000 else value[:4000] + f"â€¦ <{len(value) - 4000} chars omitted>"
         if isinstance(value, dict):
+            if value.get("type") == "image":
+                return {"type": "image", "mimeType": value.get("mimeType"), "data": "<image bytes omitted>"}
             items = list(value.items())
             compact = {str(key): cls._bounded(item, depth + 1) for key, item in items[:40]}
             if len(items) > 40:
@@ -202,7 +208,7 @@ class CodexAppServer:
     @staticmethod
     def _toml_literal(value: str) -> str:
         """Quote a string for a Codex TOML override without Windows escaping."""
-        return "'" + str(value).replace("'", "''") + "'"
+        return json.dumps(str(value), ensure_ascii=False)
 
     @staticmethod
     def _toml_array(values: list[str]) -> str:
@@ -222,18 +228,26 @@ class CodexAppServer:
         preserving a complete, per-player environment for each god session.
         """
         root = Path(bridge_root or ROOT).resolve()
-        bridge_script = root / "run_bridge.py"
         command = [
             codex_bin,
             "app-server",
+            "--strict-config",
             "-c",
             "notify=[]",
+            "-c", "features.shell_tool=false",
+            "-c", "features.unified_exec=false",
+            "-c", "features.apps=false",
+            "-c", "features.browser_use=false",
+            "-c", "features.computer_use=false",
+            "-c", "web_search='disabled'",
             "-c",
             f"mcp_servers.minecraft_god.command={CodexAppServer._toml_literal(sys.executable)}",
             "-c",
-            f"mcp_servers.minecraft_god.args={CodexAppServer._toml_array([str(bridge_script), '--no-events'])}",
+            f"mcp_servers.minecraft_god.args={CodexAppServer._toml_array(['-m', 'god_bridge.mcp_server', '--no-events'])}",
+            "-c", "mcp_servers.minecraft_god.required=true",
         ]
-        for name, value in (environment or {}).items():
+        mcp_environment = {"PYTHONPATH": str(Path(__file__).resolve().parents[1]), "MINECRAFT_GOD_HOME": str(root), **(environment or {})}
+        for name, value in mcp_environment.items():
             command.extend([
                 "-c",
                 f"mcp_servers.minecraft_god.env.{name}={CodexAppServer._toml_literal(str(value))}",
@@ -244,8 +258,9 @@ class CodexAppServer:
     def __init__(self, cwd: Path, transcript: Transcript, environment: dict[str, str] | None = None) -> None:
         self.transcript = transcript
         # Prefer the npm-installed CLI because the desktop bundle can lag behind model availability.
-        codex_bin = os.getenv("CODEX_CLI_PATH") or shutil.which("codex.cmd") or shutil.which("codex") or shutil.which("codex.exe") or "codex"
-        process_environment = os.environ.copy()
+        codex_bin = codex_binary()
+        check_version(codex_bin)
+        process_environment = runtime_environment(cwd)
         if environment:
             process_environment.update(environment)
         self.process = subprocess.Popen(
@@ -302,6 +317,7 @@ class CodexAppServer:
             "thread/tokenUsage/updated",
             "account/rateLimits/updated",
             "thread/status/changed",
+            "skills/changed",
         }
 
     def _send_message(self, message: dict[str, Any]) -> None:
@@ -327,7 +343,7 @@ class CodexAppServer:
         if method == "mcpServer/elicitation/request" and params.get("serverName") == "minecraft_god":
             return {"action": "accept", "content": CodexAppServer._default_form_content(params.get("requestedSchema"))}
         if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
-            return {"decision": "accept"}
+            return {"decision": "decline"}
         return None
 
     @staticmethod
@@ -387,16 +403,28 @@ class CodexAppServer:
 
     def close(self) -> None:
         if self.process.poll() is None:
-            self.process.terminate()
+            if self.process.stdin:
+                try:
+                    self.process.stdin.close()
+                except OSError:
+                    pass
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(self.process.pid), "/T", "/F"], capture_output=True, timeout=10)
+                else:
+                    self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
 
 
 def fetch_events(base_url: str, after: int) -> dict[str, Any]:
     query = urlencode({"after": after, "limit": 100})
-    request = Request(f"{base_url.rstrip('/')}/events?{query}")
+    request = Request(f"{base_url.rstrip('/')}/events?{query}", headers={"Authorization": f"Bearer {event_token()}"})
     with urlopen(request, timeout=3) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -417,6 +445,11 @@ def _event_for_turn(pending_events: deque[dict[str, Any]]) -> dict[str, Any] | N
         return None
     events = list(pending_events)
     pending_events.clear()
+    important = [(index, event) for index, event in enumerate(events) if event_priority(event) >= 1]
+    if len(important) > 12:
+        selected = {index for index, _ in sorted(important, key=lambda pair: (event_priority(pair[1]), -pair[0]), reverse=True)[:12]}
+        pending_events.extend(event for index, event in important if index not in selected)
+        events = [event for index, event in enumerate(events) if event_priority(event) == 0 or index in selected]
     return coalesce_events(events)
 
 
@@ -443,20 +476,26 @@ def _event_targets(event: dict[str, Any], player_id: str, player_name: str) -> b
 class GodSession:
     """One persistent Codex thread and one scoped MCP environment for a player."""
 
-    def __init__(self, player_id: str, player_name: str, root: Path, transcript: Transcript, idle_seconds: float) -> None:
+    def __init__(self, player_id: str, player_name: str, root: Path, transcript: Transcript, idle_seconds: float, *, app_server_factory=None, start_worker: bool = True) -> None:
+        player_id = validate_player_id(player_id)
         self.player_id = player_id
         self.player_name = player_name
+        self.model = os.getenv("MINECRAFT_GOD_MODEL", "gpt-6-luna").strip() or "gpt-6-luna"
+        self.reasoning_effort = os.getenv("MINECRAFT_GOD_REASONING_EFFORT", "low").strip() or "low"
         self.transcript = transcript
         self.idle_seconds = idle_seconds
         self.story_interval = max(60.0, float(os.getenv("MINECRAFT_GOD_STORY_INTERVAL_SECONDS", "180")))
         self.max_thread_turns = max(3, int(os.getenv("MINECRAFT_GOD_MAX_THREAD_TURNS", "12")))
-        self.profile_dir = root / "state" / "players" / player_id
+        self.profile_dir = profile_path(root / "state" / "players", player_id)
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.profile_dir / "god_state.json"
         self.turn_context_path = self.profile_dir / "turn_context.json"
         self.watch_receipts_path = self.profile_dir / "story_watch_receipts.json"
-        self.codex = CodexAppServer(root, transcript, {
+        self._root = root
+        self._environment = {
+            **{key: value for key, value in os.environ.items() if key.startswith("MINECRAFT_") and not key.endswith(("_TOKEN", "_PASSWORD", "_SECRET"))},
             "MINECRAFT_GOD_PLAYER_ID": player_id,
+            "MINECRAFT_GOD_HOME": str(root.resolve()),
             "MINECRAFT_GOD_PLAYER": player_name,
             "MINECRAFT_EVENTS_FILE": str(root / "state" / "events.jsonl"),
             "MINECRAFT_LEDGER_FILE": str(root / "state" / "god_ledger.sqlite3"),
@@ -466,51 +505,91 @@ class GodSession:
             "MINECRAFT_ACTIVE_PLAYER_FILE": str(self.profile_dir / "active_player.txt"),
             "MINECRAFT_TURN_CONTEXT_FILE": str(self.turn_context_path),
             "MINECRAFT_REQUIRE_GOD_SCOPE": "true",
-        })
+        }
+        self._app_server_factory = app_server_factory or CodexAppServer
+        self.codex = self._app_server_factory(root, transcript, self._environment)
         self.thread_id = ""
-        self._pending: deque[dict[str, Any]] = deque(maxlen=64)
+        self._pending: deque[dict[str, Any]] = deque()
+        self.pending_path = self.profile_dir / "pending_events.json"
+        try:
+            pending = json.loads(self.pending_path.read_text(encoding="utf-8"))
+            self._pending.extend(pending.get("pending", []))
+            if pending.get("inflight"):
+                self._pending.append({"type": "deferred_work", "summary": "The controller restarted with unfinished work. Re-observe and resume only what is still needed.", "matched_event": pending["inflight"]})
+        except (OSError, ValueError, AttributeError):
+            pass
         self._accumulated: deque[dict[str, Any]] = deque(maxlen=32)
         self._accumulated_score = 0
         self._accumulated_since = 0.0
         self._ambient: deque[dict[str, Any]] = deque(maxlen=64)
         self._ambient_score = 0
         self._ambient_since = 0.0
+        self._last_snapshot: dict[str, Any] | None = None
+        self._presence_baseline: dict[str, Any] | None = None
         self.online = True
         try:
             receipt_values = json.loads(self.watch_receipts_path.read_text(encoding="utf-8"))
             self._triggered_watch_ids: set[str] = {str(value) for value in receipt_values} if isinstance(receipt_values, list) else set()
         except (OSError, json.JSONDecodeError):
             self._triggered_watch_ids = set()
-        self._pending_event_ids: set[int] = set()
+        self._pending_event_ids: set[int] = {int(event["event_id"]) for event in self._pending if str(event.get("event_id", "")).isdigit()}
         self._condition = threading.Condition()
         self._stopping = False
         self._active_turn = False
+        self._active_turn_id = ""
+        self._active_event: dict[str, Any] | None = None
+        self._active_started_at = 0.0
+        self._active_stats: dict[str, Any] = {}
+        self._interrupt_requested_at = 0.0
+        self.max_turn_seconds = max(20, float(os.getenv("MINECRAFT_GOD_MAX_TURN_SECONDS", "90")))
+        self._profile_lock = ProfileLock(self.state_path.with_suffix(".lock"))
         self._first_join_pending = False
         self._prompt_required = True
         self._last_turn_at = time.monotonic()
         self._turn_count = 0
+        self._token_totals: dict[str, int] = {}
+        self._budget_waiting = False
+        self._failures = 0
+        self._retry_after = 0.0
+        self.max_turns_per_hour = max(1, int(os.getenv("MINECRAFT_GOD_MAX_TURNS_PER_HOUR", "60")))
+        self._turn_history_path = self.profile_dir / "turn_starts.json"
+        try:
+            self._turn_starts = [float(value) for value in json.loads(self._turn_history_path.read_text())]
+        except (OSError, ValueError, TypeError):
+            self._turn_starts = []
         self._codex_initialized = False
-        self._start_codex()
+        try:
+            self._start_codex()
+        except Exception:
+            self.codex.close()
+            raise
         self._worker = threading.Thread(target=self._run, name=f"god-{player_name}", daemon=True)
-        self._worker.start()
+        if start_worker:
+            self._worker.start()
 
     def _start_codex(self) -> None:
         old_thread_id = self.thread_id
         if not self._codex_initialized:
-            self.codex.request("initialize", {"clientInfo": {"name": "minecraft_god_controller", "title": "Minecraft God Controller", "version": "0.3.0"}})
+            self.codex.request("initialize", {"clientInfo": {"name": "minecraft_god_controller", "title": "Minecraft God Controller", "version": "0.1.0"}})
             self.codex.notify("initialized")
             self._codex_initialized = True
         thread = self.codex.request("thread/start", {
             "cwd": str(self.profile_dir),
-            "model": os.getenv("MINECRAFT_GOD_MODEL", "gpt-5.6-luna"),
+            "model": self.model,
+            # Game reactions must not inherit a slower global Codex setting.
+            "config": {"model_reasoning_effort": self.reasoning_effort},
             "approvalPolicy": "never",
-            # The Minecraft MCP actions are the god's controlled capability;
-            # Codex currently requires the full sandbox mode for these tools
-            # to run with approvalPolicy=never. The prompt forbids shell/file
-            # state access, while the bridge enforces player ownership.
-            "sandbox": "danger-full-access",
+            "sandbox": "read-only",
         })
         self.thread_id = thread["thread"]["id"]
+        self._token_totals = {}
+        if isinstance(self.codex, CodexAppServer):
+            try:
+                verify_mcp_inventory(self.codex, self.thread_id)
+            except Exception:
+                self.codex.close()
+                raise
+        self.transcript.write("model_settings", {"player_id": self.player_id, "player": self.player_name, "thread_id": self.thread_id, "model": self.model, "reasoning_effort": self.reasoning_effort})
         self._turn_count = 0
         self._prompt_required = True
         try:
@@ -525,7 +604,8 @@ class GodSession:
                 self.codex.request("thread/archive", {"threadId": old_thread_id})
             except Exception as exc:
                 print(f"[god:{self.player_name}] could not archive retired Codex thread {old_thread_id}: {exc}", file=sys.stderr)
-        print(f"[god:{self.player_name}] Codex thread ready: {self.thread_id}", file=sys.stderr)
+        if isinstance(self.codex, CodexAppServer):
+            print(f"[god:{self.player_name}] Codex thread ready: {self.thread_id}", file=sys.stderr)
 
     def _state(self) -> dict[str, Any]:
         try:
@@ -542,11 +622,10 @@ class GodSession:
         for watch in watches:
             if not isinstance(watch, dict):
                 continue
-            watch_id = str(watch.get("id", ""))
+            watch_id = self._watch_receipt(watch)
             if not watch_id or watch_id in self._triggered_watch_ids:
                 continue
             if watch_matches(watch, event):
-                self._remember_watch_trigger(watch_id)
                 self._mark_objective_achieved(watch, event)
                 milestones.append({
                     "type": "story_milestone",
@@ -563,24 +642,32 @@ class GodSession:
         objective_id = str(watch.get("objective_id", ""))
         if not objective_id:
             return
-        state = self._state()
-        changed = False
-        for objective in state.get("story_objectives", []):
-            if isinstance(objective, dict) and objective.get("id") == objective_id and objective.get("status") == "active":
-                objective["status"] = "achieved_pending_judgment"
-                objective["achieved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                objective["matched_event"] = compact_event(event)
-                changed = True
-        if changed:
-            temporary = self.state_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
-            temporary.replace(self.state_path)
+        with self._profile_lock:
+            state = self._state()
+            changed = False
+            for objective in state.get("story_objectives", []):
+                if isinstance(objective, dict) and objective.get("id") == objective_id and objective.get("status") == "active":
+                    objective["status"] = "achieved_pending_judgment"
+                    objective["achieved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    objective["matched_event"] = compact_event(event)
+                    changed = True
+            if changed:
+                temporary = self.state_path.with_suffix(".controller.tmp")
+                temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+                temporary.replace(self.state_path)
+                self.transcript.write("objective_achieved", {"player": self.player_name, "objective_id": objective_id, "event_id": event.get("event_id")})
+
+    @staticmethod
+    def _watch_receipt(watch: dict[str, Any]) -> str:
+        identifier = str(watch.get("id", ""))
+        return identifier + ":" + str(watch.get("created_at", "")) if identifier else ""
 
     def _remember_watch_trigger(self, watch_id: str) -> None:
-        self._triggered_watch_ids.add(watch_id)
-        temporary = self.watch_receipts_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(sorted(self._triggered_watch_ids), separators=(",", ":")), encoding="utf-8")
-        temporary.replace(self.watch_receipts_path)
+        with self._condition:
+            self._triggered_watch_ids.add(watch_id)
+            temporary = self.watch_receipts_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(sorted(self._triggered_watch_ids), separators=(",", ":")), encoding="utf-8")
+            temporary.replace(self.watch_receipts_path)
 
     def _deadline_milestone(self) -> dict[str, Any] | None:
         watches = self._state().get("story_watches", [])
@@ -590,9 +677,8 @@ class GodSession:
         for watch in watches:
             if not isinstance(watch, dict):
                 continue
-            watch_id = str(watch.get("id", ""))
+            watch_id = self._watch_receipt(watch)
             if watch_id and watch_id not in self._triggered_watch_ids and watch_deadline_due(watch, now):
-                self._remember_watch_trigger(watch_id)
                 return {
                     "type": "story_milestone",
                     "source": "story_director",
@@ -615,7 +701,9 @@ class GodSession:
             with self._condition:
                 if not self._ambient:
                     self._ambient_since = time.monotonic()
+                    self._presence_baseline = self._last_snapshot
                 if event_type == "player_snapshot":
+                    self._last_snapshot = compact_event(event)
                     self._ambient = deque([item for item in self._ambient if item.get("type") != "player_snapshot"], maxlen=64)
                 self._ambient.append(compact_event(event))
                 self._ambient_score += {"player_snapshot": 1, "block_place": 1, "block_break": 1, "item_acquired": 1, "mob_kill": 3, "health_threshold": 4}.get(event_type, 1)
@@ -623,9 +711,10 @@ class GodSession:
         if milestones:
             for milestone in milestones:
                 self.enqueue(milestone, first_join=first_join)
+                self._remember_watch_trigger(self._watch_receipt(milestone["watch"]))
             return "watch"
         state = self._state()
-        decision = classify_event(event, state)
+        decision = classify_event(event, state, player_id=self.player_id)
         if decision.action == "audit":
             return "audit"
         if decision.action == "wake":
@@ -671,6 +760,7 @@ class GodSession:
         enriched = dict(event)
         enriched["presence_context"] = {
             "summary": counts,
+            "changes": activity_changes(self._presence_baseline, latest_snapshot or self._last_snapshot, list(self._ambient)),
             "latest_snapshot": latest_snapshot,
             "notable_events": notable[-8:],
         }
@@ -693,6 +783,7 @@ class GodSession:
     def enqueue(self, event: dict[str, Any], *, first_join: bool = False) -> None:
         with self._condition:
             event_id = event.get("event_id")
+            normalized_event_id = 0
             if event_id not in {None, ""}:
                 try:
                     normalized_event_id = int(event_id)
@@ -702,8 +793,21 @@ class GodSession:
                     return
                 if normalized_event_id:
                     self._pending_event_ids.add(normalized_event_id)
-            if len(self._pending) >= self._pending.maxlen:
-                dropped = self._pending.popleft()
+            if len(self._pending) >= 64:
+                candidate = min(self._pending, key=event_priority)
+                if event_priority(event) == 0 and event_priority(event) < event_priority(candidate):
+                    self.transcript.write("queue_drop", {"player": self.player_name, "event": compact_event(event)})
+                    self._pending_event_ids.discard(normalized_event_id)
+                    return
+                if event_priority(candidate) >= 1:
+                    # Never discard a prayer, emergency or completed objective.
+                    self._pending.append(event)
+                    self._persist_pending()
+                    self._condition.notify()
+                    return
+                self._pending.remove(candidate)
+                dropped = candidate
+                self.transcript.write("queue_drop", {"player": self.player_name, "event": compact_event(dropped)})
                 dropped_id = dropped.get("event_id")
                 if dropped_id not in {None, ""}:
                     try:
@@ -712,7 +816,14 @@ class GodSession:
                         pass
             self._pending.append(event)
             self._first_join_pending = self._first_join_pending or first_join
+            self._persist_pending()
             self._condition.notify()
+
+    def _persist_pending(self) -> None:
+        temporary = self.pending_path.with_suffix(".tmp")
+        payload = {"pending": list(self._pending), "inflight": self._active_event if self._active_turn else None}
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        temporary.replace(self.pending_path)
 
     def _drain_notifications(self) -> None:
         while True:
@@ -720,22 +831,149 @@ class GodSession:
                 notification = self.codex.notifications.get_nowait()
             except queue.Empty:
                 return
-            if notification.get("method") == "turn/completed":
+            method = notification.get("method")
+            params = notification.get("params", {})
+            if method == "thread/tokenUsage/updated" and params.get("threadId") == self.thread_id:
+                totals = params.get("tokenUsage", {}).get("total", {})
+                if isinstance(totals, dict):
+                    tokens = self._active_stats.setdefault("tokens", {})
+                    for key, value in totals.items():
+                        if isinstance(value, int) and value >= 0:
+                            if self._active_turn:
+                                tokens[key] = tokens.get(key, 0) + max(0, value - self._token_totals.get(key, 0))
+                            self._token_totals[key] = value
+            if method == "turn/started" and not self._active_turn_id:
+                self._active_turn_id = params.get("turn", {}).get("id", self._active_turn_id)
+            if method == "item/completed" and self._active_turn and (not params.get("turnId") or params["turnId"] == self._active_turn_id):
+                item = params.get("item", {})
+                if item.get("type") == "mcpToolCall":
+                    self._record_tool_result(item)
+            if method == "turn/completed":
+                turn = params.get("turn", {})
+                if not self._active_turn:
+                    continue
+                if self._active_turn_id and turn.get("id") != self._active_turn_id:
+                    continue
+                self._active_stats.update({"player": self.player_name, "status": turn.get("status"), "duration_seconds": round(time.monotonic() - self._active_started_at, 3), "error": turn.get("error")})
+                self.transcript.write("turn_metrics", self._active_stats)
+                if turn.get("status") == "failed" and self._active_event:
+                    self._decision_failed()
+                    self.enqueue({"type": "deferred_work", "summary": "The model decision failed. Re-observe and resume only unfinished work.", "matched_event": compact_event(self._active_event)})
+                elif turn.get("status") == "completed":
+                    self._failures = 0
+                    self._retry_after = 0.0
                 self._active_turn = False
+                self._active_turn_id = ""
+                self._interrupt_requested_at = 0.0
+                with self._condition:
+                    self._persist_pending()
+                self._active_event = None
+
+    def _record_tool_result(self, item: dict[str, Any]) -> None:
+        result = item.get("result") or {}
+        value = result.get("structuredContent") or {}
+        failed = bool(item.get("status") == "failed" or result.get("isError") or value.get("ok") is False or item.get("error"))
+        error = item.get("error") or value.get("error")
+        if failed and not error:
+            error = " ".join(content.get("text", "") for content in result.get("content", []) if content.get("type") == "text")[:4000]
+        tool = item.get("tool", "unknown")
+        self._active_stats["tool_calls"] = self._active_stats.get("tool_calls", 0) + 1
+        self._active_stats["tool_failures"] = self._active_stats.get("tool_failures", 0) + int(failed)
+        speech = tool in {"god_say", "whisper_player", "broadcast_to_world"}
+        mutation = tool in {"set_block", "fill", "place_structure", "place_sign", "place_entity_on_block", "spawn_entity", "move_entity_to_block", "give_item", "teleport", "effect", "punish_player", "use_intervention", "set_weather", "set_time"}
+        if tool == "minecraft_command":
+            import re
+            mutation = bool(re.search(r"\b(?:setblock|fill|summon|place|tp|give|effect|weather|time|data (?:merge|modify))\b", str(item.get("arguments", {}).get("command", ""))))
+        confirmed = not failed and not value.get("preview") and not value.get("dry_run") and not value.get("idempotent_replay")
+        if (speech or mutation) and confirmed and "first_response_seconds" not in self._active_stats:
+            self._active_stats["first_response_seconds"] = round(time.monotonic() - self._active_started_at, 3)
+        self._active_stats["world_changes"] = self._active_stats.get("world_changes", 0) + int(mutation and confirmed)
+        self.transcript.write("tool_result", {"player": self.player_name, "turn_id": self._active_turn_id, "item_id": item.get("id"), "tool": tool, "failed": failed, "error": error, "duration_ms": item.get("durationMs"), "world_changed": mutation and confirmed, "speech": item.get("arguments", {}).get("message") if speech and confirmed else None})
+
+    def _write_turn_context(self, context: dict[str, Any]) -> None:
+        temporary = self.turn_context_path.with_suffix(".controller.tmp")
+        temporary.write_text(json.dumps(context, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(self.turn_context_path)
+
+    def _maybe_interrupt(self) -> None:
+        if not self._active_turn_id or self._interrupt_requested_at:
+            return
+        with self._condition:
+            emergency = max((event_priority(item) for item in self._pending), default=0) >= 3 and event_priority(self._active_event or {}) < 3
+        expired = time.monotonic() - self._active_started_at >= self.max_turn_seconds
+        if not emergency and not expired:
+            return
+        try:
+            context = json.loads(self.turn_context_path.read_text(encoding="utf-8"))
+            context["status"] = "interrupted" if emergency else "expired"
+            self._write_turn_context(context)
+            if self._active_event and self._active_event.get("type") != "deferred_work":
+                self.enqueue({"type": "deferred_work", "summary": "An earlier decision was paused. After addressing urgent events, re-observe and continue only unfinished work. Do not repeat confirmed actions.", "matched_event": compact_event(self._active_event)})
+            self.codex.request("turn/interrupt", {"threadId": self.thread_id, "turnId": self._active_turn_id}, timeout=5)
+            self._interrupt_requested_at = time.monotonic()
+            self.transcript.write("turn_interrupted", {"player": self.player_name, "turn_id": self._active_turn_id, "reason": "emergency" if emergency else "decision_budget"})
+        except Exception as exc:
+            self.transcript.write("interrupt_failed", {"player": self.player_name, "error": str(exc)})
+            # Back off; retain the cancellation gate while waiting for completion.
+            self._interrupt_requested_at = time.monotonic()
+
+    def _recover_stalled_turn(self, crashed: bool = False) -> None:
+        if crashed or self._interrupt_requested_at and time.monotonic() - self._interrupt_requested_at >= 20:
+            self.transcript.write("session_recovery", {"player": self.player_name, "reason": "interruption completion was not received"})
+            self.codex.close()
+            self._active_turn = False
+            self._active_turn_id = ""
+            self._interrupt_requested_at = 0.0
+            self._codex_initialized = False
+            # Reuse the original environment, preserving UUID scope.
+            self.codex = self._app_server_factory(self._root, self.transcript, self._environment)
+            self.thread_id = ""
+            self._start_codex()
+
+    def _turn_budget_available(self) -> bool:
+        cutoff = time.time() - 3600
+        self._turn_starts = [stamp for stamp in self._turn_starts if stamp > cutoff]
+        return len(self._turn_starts) < self.max_turns_per_hour
+
+    def _decision_failed(self) -> None:
+        self._failures += 1
+        self._retry_after = time.monotonic() + min(300, 15 * 2 ** min(self._failures, 5))
+
+    def _record_turn_start(self) -> None:
+        self._turn_starts.append(time.time())
+        temporary = self._turn_history_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(self._turn_starts), encoding="utf-8")
+        temporary.replace(self._turn_history_path)
 
     def _run(self) -> None:
-        while not self._stopping and self.codex.process.poll() is None:
+        while not self._stopping:
+            if self.codex.process.poll() is not None:
+                if self._active_turn and self._active_event:
+                    self.enqueue({"type": "deferred_work", "summary": "The previous session ended unexpectedly. Verify the world and resume only unfinished work.", "matched_event": compact_event(self._active_event)})
+                try:
+                    self._recover_stalled_turn(crashed=True)
+                except Exception as exc:
+                    self.transcript.write("session_recovery_failed", {"player": self.player_name, "error": str(exc)})
+                    time.sleep(5)
+                    continue
             self._drain_notifications()
             if self._active_turn:
+                self._maybe_interrupt()
+                self._recover_stalled_turn()
                 time.sleep(0.2)
                 continue
-            deadline = self._deadline_milestone()
+            if time.monotonic() < self._retry_after:
+                with self._condition:
+                    self._condition.wait(timeout=1)
+                continue
+            deadline = self._deadline_milestone() if self.online else None
             if deadline:
                 self.enqueue(deadline)
+                self._remember_watch_trigger(self._watch_receipt(deadline["watch"]))
             with self._condition:
                 state = self._state()
                 story_flush = bool(
-                    self._accumulated
+                    self.online and self._accumulated
                     and story_is_active(state)
                     and self._accumulated_since
                     and time.monotonic() - self._accumulated_since >= self.story_interval
@@ -758,6 +996,14 @@ class GodSession:
                 if not self._pending:
                     self._condition.wait(timeout=0.5)
                     continue
+                if not self._turn_budget_available():
+                    if not self._budget_waiting:
+                        self.transcript.write("turn_budget_wait", {"player": self.player_name, "limit_per_hour": self.max_turns_per_hour})
+                        self._budget_waiting = True
+                    self._condition.wait(timeout=1)
+                    continue
+                self._budget_waiting = False
+                self._record_turn_start()
                 event = _event_for_turn(self._pending)
                 if event:
                     drained = event.get("events", [event]) if event.get("type") == "event_batch" else [event]
@@ -772,6 +1018,12 @@ class GodSession:
                 self._first_join_pending = False
             self._active_turn = True
             self._last_turn_at = time.monotonic()
+            self._active_started_at = self._last_turn_at
+            self._active_event = event
+            self._active_turn_id = ""
+            self._active_stats = {"trigger": event.get("type") if event else "unknown"}
+            with self._condition:
+                self._persist_pending()
             if self._turn_count >= self.max_thread_turns:
                 old_thread = self.thread_id
                 self._start_codex()
@@ -781,17 +1033,28 @@ class GodSession:
                 "turn_id": controller_turn_id,
                 "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "event": event,
-                "urgent": bool(event and classify_event(event, self._state()).action == "wake"),
+                "urgent": bool(event and event_priority(event) >= 3),
+                "status": "active", "deadline_epoch": time.time() + self.max_turn_seconds,
             }
-            self.turn_context_path.write_text(json.dumps(context, separators=(",", ":")), encoding="utf-8")
-            self.transcript.write("turn_start", {"player_id": self.player_id, "player": self.player_name, "event": event, "idle": False})
+            self._write_turn_context(context)
+            self.transcript.write("turn_start", {"player_id": self.player_id, "player": self.player_name, "thread_id": self.thread_id, "controller_turn_id": controller_turn_id, "model": self.model, "reasoning_effort": self.reasoning_effort, "event": event, "idle": False})
             try:
                 prompt = GOD_PROMPT + "\n\n" if first_join or self._prompt_required else ""
-                self.codex.request("turn/start", {"threadId": self.thread_id, "input": [{"type": "text", "text": prompt + turn_text(event, first_join=first_join, idle=event is None, player_name=self.player_name, player_id=self.player_id)}]})
+                response = self.codex.request("turn/start", {"threadId": self.thread_id, "effort": self.reasoning_effort, "input": [{"type": "text", "text": prompt + turn_text(event, first_join=first_join, idle=event is None, player_name=self.player_name, player_id=self.player_id)}]})
+                self._active_turn_id = response.get("turn", {}).get("id", "")
                 self._prompt_required = False
                 self._turn_count += 1
             except Exception as exc:
+                context["status"] = "interrupted"
+                self._write_turn_context(context)
                 self._active_turn = False
+                self.enqueue({"type": "deferred_work", "summary": "The decision could not start. Verify the world before resuming this work.", "matched_event": compact_event(event or {})})
+                self._decision_failed()
+                try:
+                    self._recover_stalled_turn(crashed=True)
+                except Exception as recovery_error:
+                    self.transcript.write("session_recovery_failed", {"player": self.player_name, "error": str(recovery_error)})
+                time.sleep(1)
                 print(f"[god:{self.player_name}] turn failed: {exc}", file=sys.stderr)
 
     def close(self) -> None:
@@ -817,16 +1080,24 @@ def main() -> None:
         print(f"[god] {exc}; refusing to start a duplicate", file=sys.stderr)
         raise SystemExit(2)
     transcript = Transcript(ROOT)
-    max_gods = max(1, int(os.getenv("MINECRAFT_MAX_GODS", "32")))
+    max_gods = max(1, int(os.getenv("MINECRAFT_MAX_GODS", "2")))
     sessions: dict[str, GodSession] = {}
     try:
-        cursor = wait_for_event_hub(event_url)
-        print(f"[god] Waiting for players to join; ignoring {cursor} old events", file=sys.stderr)
+        latest = wait_for_event_hub(event_url)
+        cursor_path = ROOT / "state" / "controller_cursor.json"
+        try:
+            cursor = min(latest, max(0, int(json.loads(cursor_path.read_text(encoding="utf-8"))["event_id"])))
+        except (OSError, ValueError, KeyError, TypeError):
+            cursor = latest
+        print(f"[god] Waiting for players; resuming events after {cursor}", file=sys.stderr)
+        cursor_path.parent.mkdir(parents=True, exist_ok=True)
+        cursor_path.write_text(json.dumps({"event_id": cursor}), encoding="utf-8")
         ready_file.parent.mkdir(parents=True, exist_ok=True)
         ready_file.write_text("ready\n", encoding="utf-8")
         ledger_path = Path(os.getenv("MINECRAFT_LEDGER_FILE", str(ROOT / "state" / "god_ledger.sqlite3")))
+        ledger = GodLedger(ledger_path)
         try:
-            existing_players = GodLedger(ledger_path).players()
+            existing_players = ledger.players()
         except Exception as exc:
             existing_players = []
             print(f"[god] could not load existing player profiles: {exc}", file=sys.stderr)
@@ -879,6 +1150,21 @@ def main() -> None:
                         transcript.write("controller_event", {"routed_to": [player_id], "disposition": disposition, "event": compact_event(event)})
                     continue
 
+                # A retained prayer or watch completion can belong to a player
+                # who disconnected while the controller was unavailable.
+                for profile in ledger.players():
+                    player_id, player_name = profile["player_id"], profile["name"]
+                    if player_id in sessions or len(sessions) >= max_gods or not _event_targets(event, player_id, player_name):
+                        continue
+                    saved_profile = profile_path(ROOT / "state" / "players", player_id) / "god_state.json"
+                    try:
+                        saved_state = json.loads(saved_profile.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        saved_state = {}
+                    if classify_event(event, saved_state, player_id=player_id).action == "wake" or any(watch_matches(watch, event) for watch in saved_state.get("story_watches", []) if isinstance(watch, dict)):
+                        restored = GodSession(player_id, player_name, ROOT, transcript, idle_seconds)
+                        restored.online = bool(profile.get("online"))
+                        sessions[player_id] = restored
                 recipients = [session for session in sessions.values() if _event_targets(event, session.player_id, session.player_name)]
                 if recipients:
                     routing = {}
@@ -886,6 +1172,9 @@ def main() -> None:
                         routing[session.player_id] = session.ingest(event)
                     if any(disposition != "audit" for disposition in routing.values()):
                         transcript.write("controller_event", {"routed_to": routing, "event": compact_event(event)})
+            cursor_temporary = cursor_path.with_suffix(".tmp")
+            cursor_temporary.write_text(json.dumps({"event_id": cursor}), encoding="utf-8")
+            cursor_temporary.replace(cursor_path)
             time.sleep(0.5)
     finally:
         ready_file = Path(os.getenv("MINECRAFT_GOD_READY_FILE", str(ROOT / "logs" / "god-controller.ready")))

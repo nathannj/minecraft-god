@@ -1,0 +1,14 @@
+name: Feature idea
+description: Suggest an improvement to the player or contributor experience.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What should become possible or easier?
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Example gameplay or contributor scenario
+      description: Explain how you would know the change worked.

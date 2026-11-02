@@ -1,0 +1,36 @@
+name: Draft release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '25'
+      - run: python -m pip install '.[dev]'
+      - run: bash paper-plugin/gradlew -p paper-plugin build --no-daemon
+      - run: python -m pytest -q
+      - run: python scripts/check_release.py --tag "$GITHUB_REF_NAME"
+      - run: python -m build
+      - run: python scripts/check_wheel.py
+      - name: Prepare checksums and a draft for human review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp paper-plugin/build/libs/*.jar dist/
+          cd dist
+          sha256sum *.whl *.tar.gz *.jar > SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --generate-notes ./*

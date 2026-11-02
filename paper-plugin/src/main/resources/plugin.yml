@@ -4,7 +4,34 @@ main: com.minecraftgod.bridge.MinecraftGodPlugin
 api-version: '26.2'
 description: Sends UUID-tagged Minecraft events to the local multi-god bridge.
 author: MinecraftGod
+softdepend: [voicechat, XaeroTracker]
 commands:
+  godvoice:
+    description: Control whether your proximity speech is transcribed for AI God.
+    usage: /godvoice <on|off|status>
+  map:
+    description: Show the minimap, world map and waypoint shortcuts.
+  waypoint:
+    description: Share your current location as a named map waypoint.
+    usage: /waypoint <name>
+  godsmite:
+    description: Strike one approved subject without collateral damage.
+    permission: minecraftgod.smite
+  godobserve:
+    description: Return compact live player telemetry in one request.
+    permission: minecraftgod.scan
+  godcheckbatch:
+    description: Inspect up to 128 blocks in one server operation.
+    permission: minecraftgod.scan
+  godsurface:
+    description: Find a safe surface in the owned player's current column.
+    permission: minecraftgod.scan
+  godfootprint:
+    description: Summarize a bounded building footprint.
+    permission: minecraftgod.scan
+  godvalidate:
+    description: Check current other-player presence in an affected area.
+    permission: minecraftgod.scan
   godscan:
     description: Return exact nearby blocks, signs, and entity positions for the Minecraft God.
     usage: /godscan <player> [radius] [vertical-radius]
@@ -28,6 +55,9 @@ commands:
     description: Speak privately to your personal god.
     usage: /whisper god <message>
 permissions:
+  minecraftgod.smite:
+    description: Allow server-authorized damage to one subject.
+    default: op
   minecraftgod.scan:
     description: Allow the bridge to inspect a local scene.
     default: op

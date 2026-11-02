@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,8 +18,10 @@ from typing import Any, Callable
 
 from .rcon import RconClient
 from .ledger import GodLedger, expiry_after
-from .story import DIRECT_GOD_ADDRESS, compact_event
+from .story import DIRECT_GOD_ADDRESS, compact_event, validate_watch
 from .structures import StructureLibrary
+from .authority import authorize, check_world_bounds
+from .state_lock import ProfileLock, profile_transaction
 
 
 def utc_now() -> str:
@@ -47,7 +50,7 @@ def absolute_block_position(value: str) -> tuple[int, int, int]:
     position = parse_position(value)
     if "~" in position:
         raise ValueError("remote positions must use absolute coordinates")
-    return tuple(int(float(token)) for token in position.split())  # type: ignore[return-value]
+    return tuple(math.floor(float(token)) for token in position.split())  # type: ignore[return-value]
 
 
 def landmark_key(value: str) -> str:
@@ -72,8 +75,10 @@ def assess_conduct(message: str) -> dict[str, Any]:
     """Score sustained abuse without treating ordinary frustration as blasphemy."""
     normalized = re.sub(r"\s+", " ", message.casefold()).strip()
     profanity = re.findall(r"\b(?:fuck\w*|pussy|retard\w*|nonce|dipshit|bitch\w*|cunt\w*)\b", normalized)
-    threat = bool(re.search(r"\b(?:kill|end|open your|sword up|burn me alive)\b", normalized))
-    points = min(2, len(profanity)) + (2 if threat else 0)
+    insult = r"(?:fuck\w*|pussy|retard\w*|nonce|dipshit|bitch\w*|cunt\w*)"
+    directed = bool(re.search(rf"\b(?:fuck\s+(?:you|off)|you(?:'re| are)?\s+(?:(?:a|an|the|such|fucking)\s+){{0,3}}{insult}|{insult}\s+(?:god|deity)|god\s+is\s+(?:(?:a|an|the)\s+)?{insult})\b", normalized))
+    threat = bool(re.search(r"\b(?:kill|end|destroy|delete|hurt)\s+(?:you|your\s+(?:memory|existence))\b", normalized))
+    points = (min(2, len(profanity)) if directed else 0) + (2 if threat else 0)
     if points == 0:
         return {"points": 0, "severity": "none", "reason": "ordinary speech"}
     severity = "severe" if points >= 3 else "abusive"
@@ -85,7 +90,7 @@ class BridgeConfig:
     rcon_host: str = "127.0.0.1"
     rcon_port: int = 25575
     rcon_password: str = ""
-    player_name: str = "IAmBoreder"
+    player_name: str = "Player"
     god_player_id: str = ""
     god_player_name: str = ""
     profile_dir: str = "state/players"
@@ -97,7 +102,7 @@ class BridgeConfig:
     state_file: str = "state/god_state.json"
     events_file: str | None = None
     ledger_file: str | None = None
-    max_gods: int = 32
+    max_gods: int = 2
     require_god_scope: bool = False
     dry_run: bool = False
     max_command_length: int = 512
@@ -105,7 +110,7 @@ class BridgeConfig:
     camera_plugin_render_dir: str = "plugins/SpectatorCamera/renders"
     camera_timeout: int = 120
     structure_catalog_file: str = "state/structure_catalog.json"
-    structure_datapacks_dir: str = "server/world/datapacks"
+    structure_datapacks_dir: str = "world/datapacks"
     structure_download_dir: str = "state/structure_downloads"
     structure_max_download_mb: int = 64
     minecraft_version: str = "26.2"
@@ -137,6 +142,9 @@ DEFAULT_GOD_STATE = {
     "last_consequence_at": "",
     "consequence_count": 0,
     "memories": [],
+    "values": [],
+    "judgment_style": "",
+    "player_choice_history": [],
 }
 
 MAX_MEMORIES = 64
@@ -274,6 +282,9 @@ def _wait_for_new_png(render_dir: Path, before: dict[str, tuple[int, int]], time
     return None
 
 
+from .runtime import workspace_root, player_id as validate_player_id
+
+
 class GodBridge:
     def __init__(self, config: BridgeConfig, rcon: Any | None = None) -> None:
         self.config = config
@@ -283,6 +294,8 @@ class GodBridge:
         self._chat: deque[dict[str, Any]] = deque(maxlen=50)
         configured_state = self._absolute_path(config.state_file)
         self._owner_id = self._normalize_owner_id(config.god_player_id)
+        if config.god_player_id and not self._owner_id:
+            raise ValueError("god_player_id must be a valid UUID")
         if config.require_god_scope and not self._owner_id:
             raise ValueError("MINECRAFT_REQUIRE_GOD_SCOPE is enabled but no player UUID was provided")
         self._profile_dir = self._absolute_path(config.profile_dir)
@@ -290,29 +303,85 @@ class GodBridge:
             self._state_path = self._profile_dir / self._profile_key(self._owner_id) / "god_state.json"
         else:
             self._state_path = configured_state
+        self._lock = ProfileLock(self._state_path.with_suffix(".lock"))
         self._events_path = self._absolute_path(config.events_file) if config.events_file else self._state_path.with_name("events.jsonl")
         ledger_path = self._absolute_path(config.ledger_file) if config.ledger_file else configured_state.with_name("god_ledger.sqlite3")
         self._ledger = GodLedger(ledger_path)
         self._next_event_id = 1
         self._god_state = self._load_state()
         self._refresh_events()
+        self._inspection_turn = ""
+        self._inspection_count = 0
+        self._migration_warnings: list[dict[str, Any]] = []
+        self._restore_landmark_ownership()
+        self._restore_entity_ownership()
+
+    def _restore_landmark_ownership(self) -> None:
+        """Protect verified private landmarks created before the ownership ledger."""
+        for profile in self._profile_dir.glob("*/god_state.json"):
+            owner = self._normalize_owner_id(profile.parent.name)
+            if not owner:
+                continue
+            with ProfileLock(profile.with_suffix(".lock")):
+                state = self._load_state_from(profile)
+            for key, value in state.get("landmarks", {}).items():
+                if not isinstance(value, dict) or value.get("visibility", "private") != "private" or value.get("confidence", "verified") != "verified":
+                    continue
+                identifier = f"landmark:{owner}:{key}"
+                if self._ledger.resource(identifier):
+                    continue
+                try:
+                    x, y, z = absolute_block_position(value["position"])
+                    self._ledger.claim_resource(identifier, "region", owner, {"dimension": normalize_dimension(value.get("dimension", "minecraft:overworld")), "participants": [owner], "bounds": value.get("bounds") or {"min": f"{x-4} {y-4} {z-4}", "max": f"{x+4} {y+4} {z+4}"}})
+                except (ValueError, KeyError, PermissionError, TypeError) as error:
+                    # Conflicting historical claims require an explicit agreement.
+                    self._migration_warnings.append({"player_id": owner, "landmark_id": key, "error": str(error)})
+                    continue
+
+    def _restore_entity_ownership(self) -> None:
+        identifier = "migration:entity-audit-v1"
+        if self._ledger.resource(identifier):
+            return
+        if self._events_path.exists():
+            with self._events_path.open(encoding="utf-8", errors="replace") as stream:
+                for row in stream:
+                    try:
+                        event = json.loads(row)
+                        owner = self._normalize_owner_id(event.get("player_uuid", ""))
+                        command = str(event.get("command", ""))
+                        if not owner or event.get("type") != "god_action" or event.get("source") != "god" or "summon " not in command or looks_like_command_failure(str(event.get("result", ""))):
+                            continue
+                        for tag_list in re.findall(r"Tags\s*:\s*\[([^\]]*)\]", command):
+                            for tag in re.findall(r"['\"]([A-Za-z0-9_.-]{1,32})['\"]", tag_list):
+                                self._ledger.claim_resource("entity:" + tag, "entity", owner, {"tag": tag, "legacy_event_id": event.get("event_id")})
+                    except (ValueError, TypeError, PermissionError):
+                        continue
+        self._ledger.claim_resource(identifier, "migration", "system", {"completed_at": utc_now()})
+
+    def _register_observed_entities(self, scan: dict[str, Any]) -> None:
+        for entity in scan.get("entities", []):
+            if not isinstance(entity, dict) or not entity.get("uuid"):
+                continue
+            if any((resource := self._ledger.resource("entity:" + tag)) and resource["owner_id"] == self._owner_id for tag in entity.get("tags", [])):
+                self._ledger.claim_resource("entity:" + entity["uuid"], "entity", self._owner_id, {"tags": entity.get("tags", [])})
 
     @staticmethod
     def _normalize_owner_id(value: str) -> str:
         value = str(value or "").strip().lower()
-        if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f-]{27,}", value) or re.fullmatch(r"[0-9a-f]{32}", value):
-            return value
-        return ""
+        try:
+            return str(uuid.UUID(value))
+        except ValueError:
+            return ""
 
     @staticmethod
     def _profile_key(player_id: str) -> str:
-        return re.sub(r"[^a-z0-9-]", "", player_id.casefold())[:64]
+        return validate_player_id(player_id)
 
     def _absolute_path(self, value: str | Path | None) -> Path:
         if value is None:
             return Path("")
         path = Path(value)
-        return path if path.is_absolute() else Path(__file__).resolve().parents[1] / path
+        return path if path.is_absolute() else workspace_root() / path
 
     @property
     def owner_id(self) -> str:
@@ -353,6 +422,8 @@ class GodBridge:
 
     @staticmethod
     def _event_dedupe_key(event: dict[str, Any]) -> str:
+        if event.get("event_uuid"):
+            return "paper:" + str(event["event_uuid"])
         explicit = event.get("dedupe_key")
         if explicit not in {None, ""}:
             return f"explicit:{explicit}"
@@ -393,7 +464,7 @@ class GodBridge:
         return state
 
     def _state_path_for(self, player_id: str) -> Path:
-        if self._owner_id and player_id == self._owner_id:
+        if not player_id or (self._owner_id and player_id == self._owner_id):
             return self._state_path
         return self._profile_dir / self._profile_key(player_id) / "god_state.json"
 
@@ -406,7 +477,7 @@ class GodBridge:
     @staticmethod
     def _save_state_to(path: Path, state: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary = path.with_suffix(path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
         temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
         temporary.replace(path)
 
@@ -423,6 +494,9 @@ class GodBridge:
         """Return whether an event belongs in this god's private context."""
         if not self._owner_id:
             return True
+        if event.get("type") == "voice_transcript":
+            from .story import event_targets
+            return event_targets(event, self._owner_id, self.current_player_name())
         fields = ("player_uuid", "victim_uuid", "killer_uuid", "target_player_id", "from_player_id", "to_player_id")
         if any(str(event.get(field, "")).lower() == self._owner_id for field in fields):
             return True
@@ -446,7 +520,7 @@ class GodBridge:
         for id_key, name_key in (("player_uuid", "player"), ("victim_uuid", "victim"), ("killer_uuid", "killer")):
             player_id = str(clean.get(id_key, "") or "").strip().lower()
             player_name = str(clean.get(name_key, "") or "").strip()
-            if player_id and player_name:
+            if player_id and player_name and clean["type"] != "voice_transcript":
                 try:
                     self._ledger.register_player(player_id, player_name, online=clean["type"] != "player_quit")
                 except ValueError:
@@ -465,11 +539,11 @@ class GodBridge:
                 conduct = assess_conduct(clean["message"])
                 clean["conduct"] = conduct
                 now = time.time()
-                with self._lock:
-                    consequence_player_id = player_id or self._owner_id
-                    if consequence_player_id and consequence_player_id != self._owner_id:
-                        consequence_state = self._load_state_for(consequence_player_id)
-                        consequence_path = self._state_path_for(consequence_player_id)
+                consequence_player_id = player_id or self._owner_id
+                consequence_path = self._state_path_for(consequence_player_id) if consequence_player_id else self._state_path
+                profile_lock = self._lock if consequence_path == self._state_path else ProfileLock(consequence_path.with_suffix(".lock"))
+                with profile_lock:
+                    consequence_state = self._load_state_from(consequence_path)
                     window_started = _parse_epoch(consequence_state.get("conduct_window_started_at"))
                     if window_started is None or now - window_started > 180:
                         consequence_state["conduct_score"] = 0
@@ -515,34 +589,46 @@ class GodBridge:
         player = self.current_player_name() if not player_id or player_id == self._owner_id else str((self._ledger.player(player_id) or {}).get("name", ""))
         if not player:
             return {"ok": False, "error": "consequence target is not registered"}
-        result = self._execute_targeted(f"execute at {player} run summon minecraft:lightning_bolt ~ ~ ~", player_id or self._owner_id)
+        result = self._execute_targeted(f"godsmite {player}", player_id or self._owner_id, capability=True)
         result["action"] = "automatic_consequence"
         result["consequence_level"] = level
         state_path = self._state_path_for(player_id or self._owner_id)
-        state = self._god_state if not player_id or player_id == self._owner_id else self._load_state_for(player_id)
-        state["last_major_intervention"] = f"Automatic consequence level {level}: lightning answered sustained blasphemy."
-        self._save_state_to(state_path, state)
-        if state_path == self._state_path:
-            self._god_state = state
+        lock = self._lock if state_path == self._state_path else ProfileLock(state_path.with_suffix(".lock"))
+        with lock:
+            state = self._load_state_from(state_path)
+            if result.get("ok"):
+                state["last_major_intervention"] = f"Automatic consequence level {level}: lightning answered sustained blasphemy."
+                self._save_state_to(state_path, state)
+            if state_path == self._state_path:
+                self._god_state = state
         return result
 
     def _refresh_events(self) -> None:
-        if not self._events_path.exists():
-            return
-        try:
-            rows = self._events_path.read_text(encoding="utf-8").splitlines()[-100:]
-        except OSError:
+        # SQLite is authoritative and indexed. Do not rescan the growing audit
+        # log every time a controller polls or a god asks for recent events.
+        events = self._ledger.recent_events(100)
+        if not events and not getattr(self, "_legacy_events_loaded", False):
+            self._legacy_events_loaded = True
+            if self._events_path.exists():
+                with self._events_path.open("rb") as stream:
+                    stream.seek(0, 2)
+                    size = stream.tell()
+                    stream.seek(max(0, size - 1024 * 1024))
+                    if size > 1024 * 1024:
+                        stream.readline()  # skip a partial first record
+                    for row in stream.read().splitlines()[-100:]:
+                        try:
+                            event = json.loads(row)
+                            if isinstance(event, dict):
+                                events.append(event)
+                        except (ValueError, UnicodeError):
+                            continue
+        if not events:
             return
         with self._lock:
             self._events.clear()
             self._chat.clear()
-            for row in rows:
-                try:
-                    event = json.loads(row)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(event, dict):
-                    continue
+            for event in events:
                 event_id = int(event.get("event_id", self._next_event_id))
                 self._next_event_id = max(self._next_event_id, event_id + 1)
                 self._events.append(event)
@@ -552,15 +638,7 @@ class GodBridge:
     def _assert_command_authorized(self, command: str, *, target_player_id: str = "", capability: bool = False, allow_shared: bool = False) -> None:
         if not self._owner_id or capability or allow_shared:
             return
-        if target_player_id and target_player_id != self._owner_id:
-            raise PermissionError("a god may only affect its own player unless it consumes an approved intervention")
-        lowered = command.casefold()
-        if re.search(r"@[apr]\b", lowered) or re.search(r"@e(?!\[tag=god_[a-z0-9_.-]+)", lowered):
-            raise PermissionError("player selectors that can affect another player are not available to a player god")
-        for profile in self._ledger.players():
-            name = str(profile.get("name", ""))
-            if profile.get("player_id") != self._owner_id and re.search(rf"(?<![A-Za-z0-9_]){re.escape(name.casefold())}(?![A-Za-z0-9_])", lowered):
-                raise PermissionError(f"command targets another player's god-owned subject: {name}")
+        authorize(self, command, target_player_id)
 
     def _execute_targeted(self, command: str, target_player_id: str, *, capability: bool = False) -> dict[str, Any]:
         self._assert_command_authorized(command, target_player_id=target_player_id, capability=capability)
@@ -569,17 +647,24 @@ class GodBridge:
     def execute(self, command: str, *, record: bool = True, target_player_id: str = "", capability: bool = False, allow_shared: bool = False, idempotency_key: str = "") -> dict[str, Any]:
         if not isinstance(command, str) or not command.strip():
             raise ValueError("command must be a non-empty string")
-        if len(command) > self.config.max_command_length:
+        command_limit = 8192 if command.startswith("godcheckbatch ") else self.config.max_command_length
+        if len(command) > command_limit:
             raise ValueError(f"command exceeds {self.config.max_command_length} characters")
         if any(char in command for char in "\r\n\x00"):
             raise ValueError("command cannot contain newlines or NUL bytes")
         command = command.strip().lstrip("/")
+        context = self._turn_context()
+        if (record or capability) and context.get("status") in {"interrupted", "expired"}:
+            raise PermissionError("this decision was interrupted; wait for the new trigger before acting")
+        if (record or capability) and context.get("deadline_epoch") and time.time() >= context["deadline_epoch"]:
+            raise PermissionError("decision budget expired; preserve the work in state and use a bounded next step")
         self._assert_command_authorized(command, target_player_id=target_player_id, capability=capability, allow_shared=allow_shared)
         self._validate_command_preflight(command)
         if idempotency_key:
             if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", idempotency_key):
                 raise ValueError("idempotency_key must contain only letters, numbers, dot, underscore, colon, or hyphen")
-            cached = self._ledger.cached_action(idempotency_key)
+            cache_key = f"{self._owner_id}:{idempotency_key}" if self._owner_id else idempotency_key
+            cached = self._ledger.cached_action(cache_key)
             if cached:
                 replay = dict(cached)
                 replay["idempotent_replay"] = True
@@ -595,11 +680,24 @@ class GodBridge:
                 "dry_run": False,
                 "output": output,
             }
+            if not output.strip() and re.search(r"\b(?:if|unless)\b", command):
+                result["ok"] = False
+            if command.split()[0].startswith("god"):
+                try:
+                    plugin_result = json.loads(output)
+                    if isinstance(plugin_result, dict) and (plugin_result.get("ok") is False or plugin_result.get("error")):
+                        result["ok"] = False
+                        result["error"] = plugin_result.get("error", "Plugin rejected the action")
+                except ValueError:
+                    result["ok"] = False
             if not result["ok"]:
-                result["error"] = "Minecraft rejected the command or found no matching target."
-        if idempotency_key:
-            self._ledger.remember_action(idempotency_key, result)
+                result.setdefault("error", "Minecraft rejected the command or found no matching target.")
+        if idempotency_key and result.get("ok"):
+            self._ledger.remember_action(cache_key, result)
         if record:
+            leaf = command.rsplit(" run ", 1)[-1]
+            if result.get("ok") and re.match(r"(?:setblock|fill|summon|place|tp|teleport|give|clear|kill|effect|weather|time|godsmite|data (?:merge|modify|remove))\b", leaf):
+                self._ledger.record_world_change(self._owner_id, {"command": command, "turn_id": context.get("turn_id"), "idempotency_key": idempotency_key, "confirmed": True})
             action_event: dict[str, Any] = {
                 "type": "god_action",
                 "source": "god",
@@ -680,6 +778,7 @@ class GodBridge:
             return {"ok": False, "error": "godscan returned non-JSON output", "output": result.get("output", "")}
         if isinstance(scan, dict) and scan.get("error"):
             return {"ok": False, "error": scan.get("error"), "scan": scan}
+        self._register_observed_entities(scan)
         return {"ok": True, "scan": scan}
 
     def inspect_area_at(
@@ -707,10 +806,18 @@ class GodBridge:
             return {"ok": False, "error": "godscanat returned non-JSON output", "output": result.get("output", "")}
         if isinstance(scan, dict) and scan.get("error"):
             return {"ok": False, "error": scan.get("error"), "scan": scan}
+        self._register_observed_entities(scan)
         return {"ok": True, "scan": scan, "remote": True}
 
     def inspect_block(self, position: str, dimension: str = "") -> dict[str, Any]:
         """Inspect one exact block locally or in an explicitly named dimension."""
+        turn_id = str(self._turn_context().get("turn_id", ""))
+        if turn_id:
+            if turn_id != self._inspection_turn:
+                self._inspection_turn, self._inspection_count = turn_id, 0
+            if self._inspection_count >= 12:
+                raise ValueError("single-block inspection budget reached; use inspect_blocks, inspect_footprint, or find_safe_surface")
+            self._inspection_count += 1
         if dimension:
             x, y, z = absolute_block_position(position)
             dimension = normalize_dimension(dimension)
@@ -731,12 +838,39 @@ class GodBridge:
         """Batch exact block checks into one model-visible operation."""
         if not isinstance(positions, list) or not positions or len(positions) > 128:
             raise ValueError("positions must contain between 1 and 128 coordinate strings")
-        results = [self.inspect_block(position, dimension) for position in positions]
-        return {
-            "ok": all(result.get("ok") for result in results),
-            "dimension": normalize_dimension(dimension) if dimension else "player_current_dimension",
-            "results": results,
-        }
+        base = self._player_position() if not dimension and any("~" in value for value in positions) else (0, 0, 0)
+        resolved = [absolute_block_position(position) if dimension else tuple(_resolve_coordinate(token, coordinate, block=True) for token, coordinate in zip(parse_position(position).split(), base)) for position in positions]
+        if not dimension:
+            observed = self._compact_player_observation()
+            if not observed.get("ok"):
+                return observed
+            dimension = observed["dimension"]
+        command = "godcheckbatch " + normalize_dimension(dimension) + " " + " ".join(",".join(str(v) for v in point) for point in resolved)
+        return self._plugin_json(command)
+
+    def _plugin_json(self, command: str) -> dict[str, Any]:
+        result = self.execute(command, record=False)
+        try:
+            value = json.loads(result["output"])
+        except (ValueError, KeyError):
+            return {"ok": False, "error": "compact observation unavailable; rebuild/install the Paper bridge plugin", "output": result.get("output", "")}
+        if not isinstance(value, dict):
+            return {"ok": False, "error": "invalid plugin observation"}
+        return value
+
+    def _compact_player_observation(self) -> dict[str, Any]:
+        return self._plugin_json(f"godobserve {self.current_player_name()}")
+
+    def find_safe_surface(self) -> dict[str, Any]:
+        return self._plugin_json(f"godsurface {self.current_player_name()}")
+
+    def inspect_footprint(self, start: str, end: str, dimension: str) -> dict[str, Any]:
+        first, last = absolute_block_position(start), absolute_block_position(end)
+        low = [min(a, b) for a, b in zip(first, last)]
+        high = [max(a, b) for a, b in zip(first, last)]
+        if math.prod(b - a + 1 for a, b in zip(low, high)) > 4096 or any(b - a > 47 for a, b in zip(low, high)):
+            raise ValueError("footprint must fit 4096 blocks and 48 blocks per axis")
+        return self._plugin_json(f"godfootprint {normalize_dimension(dimension)} " + " ".join(str(v) for v in low + high))
 
     def capture_scene(
         self,
@@ -767,10 +901,20 @@ class GodBridge:
         return self._capture_scanned_scene(scene)
 
     def _capture_scanned_scene(self, scene: dict[str, Any]) -> dict[str, Any]:
+        # SpectatorCamera has one global camera; hold a process-shared lock
+        # across positioning, rendering, waiting, and copying both views.
+        lock_path = self._absolute_path(self.config.camera_plugin_render_dir) / ".capture.lock"
+        try:
+            with ProfileLock(lock_path, timeout=30):
+                return self._capture_scanned_scene_unlocked(scene)
+        except TimeoutError:
+            return {"ok": False, "error": "The camera is busy with another god. Retry later.", "scene": scene}
+
+    def _capture_scanned_scene_unlocked(self, scene: dict[str, Any]) -> dict[str, Any]:
         if not scene.get("ok"):
             return {"ok": False, "error": "Could not capture because the live scene scan failed.", "scene": scene}
 
-        workspace = Path(__file__).resolve().parents[1]
+        workspace = workspace_root()
         render_dir = Path(self.config.camera_plugin_render_dir)
         if not render_dir.is_absolute():
             render_dir = workspace / render_dir
@@ -810,7 +954,7 @@ class GodBridge:
             rendered_path = _wait_for_new_png(render_dir, before, timeout)
             if rendered_path is None:
                 return {"ok": False, "error": f"SpectatorCamera timed out while rendering the {view_name} view.", "scene": scan}
-            destination = output_dir / f"scene-{int(time.time() * 1000)}-{view_name}.png"
+            destination = output_dir / f"scene-{uuid.uuid4().hex}-{view_name}.png"
             destination.write_bytes(rendered_path.read_bytes())
             images.append({"view": view_name, "path": str(destination), "camera": {"world": world, "x": x, "y": y, "z": z, "yaw": yaw, "pitch": pitch}})
 
@@ -837,7 +981,7 @@ class GodBridge:
         if self._owner_id:
             return self._owner_id
         active_name = ""
-        active_file = Path(self.config.active_player_file)
+        active_file = self._absolute_path(self.config.active_player_file)
         try:
             active_name = active_file.read_text(encoding="utf-8").strip()
         except OSError:
@@ -848,7 +992,7 @@ class GodBridge:
     def current_player_name(self) -> str:
         if self._owner_id:
             return self._owner_profile()["name"]
-        active_file = Path(self.config.active_player_file)
+        active_file = self._absolute_path(self.config.active_player_file)
         try:
             active_name = active_file.read_text(encoding="utf-8").strip()
         except OSError:
@@ -893,24 +1037,27 @@ class GodBridge:
             "god_state": self.get_god_state(),
             "recent_events": self.recent_story_events(6),
             "recent_chat": [compact_event(event) for event in self.read_chat(4)],
+            "agreements": self._ledger.agreements_for(self._owner_id) if self._owner_id else [],
+            "recent_world_changes": self._ledger.world_changes_for(self._owner_id),
+            "ownership_migration_warnings": self._migration_warnings[:12],
         }
+        landmarks = self.list_landmarks()["landmarks"]
+        trigger = json.dumps(self._turn_context().get("event", {})).casefold()
+        observation["referenced_landmarks"] = [landmark for landmark in landmarks if any(
+            re.search(r"(?<!\w)" + re.escape(str(name).casefold()) + r"(?!\w)", trigger)
+            for name in [landmark.get("name", ""), landmark.get("id", "").replace("_", " ")] + landmark.get("aliases", []) if name
+        )][:8]
         if self.config.dry_run:
             observation["connection"] = "dry_run"
             return observation
 
-        queries = {
-            "position": f"data get entity {player_name} Pos",
-            "health": f"data get entity {player_name} Health",
-            "food": f"data get entity {player_name} foodLevel",
-            "dimension": f"data get entity {player_name} Dimension",
-        }
         observation["connection"] = "rcon"
-        observation["queries"] = {}
-        for name, command in queries.items():
-            try:
-                observation["queries"][name] = self.execute(command, record=False)["output"]
-            except Exception as exc:  # observation should degrade gracefully
-                observation["queries"][name] = {"error": str(exc)}
+        telemetry = self._compact_player_observation()
+        observation["telemetry"] = telemetry
+        observation["queries"] = {
+            "position": "[" + ", ".join(f"{part}d" for part in str(telemetry.get("position", "")).split()) + "]",
+            "health": telemetry.get("health"), "food": telemetry.get("food"), "dimension": telemetry.get("dimension", ""),
+        }
         raw_position = str(observation["queries"].get("position", ""))
         coordinates = re.findall(r"(-?\d+(?:\.\d+)?)d", raw_position)
         current_dimension = ""
@@ -920,7 +1067,7 @@ class GodBridge:
         nearby = []
         if len(coordinates) >= 3:
             current = tuple(float(value) for value in coordinates[-3:])
-            for landmark in observation["god_state"].get("landmarks", {}).values():
+            for landmark in landmarks:
                 if not isinstance(landmark, dict) or str(landmark.get("dimension", "")).casefold() != current_dimension:
                     continue
                 try:
@@ -959,6 +1106,9 @@ class GodBridge:
             return [event for event in self._events if self.event_matches_owner(event)][-limit:]
 
     def events_since(self, after_event_id: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        durable = self._ledger.events_since(after_event_id, limit)
+        if durable:
+            return [event for event in durable if self.event_matches_owner(event)]
         self._refresh_events()
         with self._lock:
             return [event for event in self._events if int(event.get("event_id", 0)) > after_event_id and self.event_matches_owner(event)][:max(1, min(limit, 200))]
@@ -966,7 +1116,7 @@ class GodBridge:
     def latest_event_id(self) -> int:
         self._refresh_events()
         with self._lock:
-            return self._next_event_id - 1
+            return max(self._next_event_id - 1, self._ledger.latest_event_id())
 
     def get_god_state(self) -> dict[str, Any]:
         with self._lock:
@@ -999,14 +1149,11 @@ class GodBridge:
                         memories.append(memory)
                 self._god_state["memories"] = memories[-MAX_MEMORIES:]
             if incoming_landmarks is not None:
-                if not isinstance(incoming_landmarks, dict):
-                    raise ValueError("landmarks must be an object")
-                landmarks = dict(self._god_state.get("landmarks", {}))
-                landmarks.update(incoming_landmarks)
-                self._god_state["landmarks"] = dict(list(landmarks.items())[-MAX_LANDMARKS:])
+                raise ValueError("use remember_landmark so dimensions, coordinates and ownership are validated")
             self._save_state()
             return self.get_god_state()
 
+    @profile_transaction
     def remember_landmark(self, landmark: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(landmark, dict):
             raise ValueError("landmark must be an object")
@@ -1039,6 +1186,9 @@ class GodBridge:
                 "min": " ".join(str(min(a, b)) for a, b in zip(min_pos, max_pos)),
                 "max": " ".join(str(max(a, b)) for a, b in zip(min_pos, max_pos)),
             }
+        if self._owner_id and clean["visibility"] == "private" and clean["confidence"] == "verified":
+            protected_bounds = clean.get("bounds", {"min": f"{x - 4} {y - 4} {z - 4}", "max": f"{x + 4} {y + 4} {z + 4}"})
+            self._ledger.claim_resource(f"landmark:{self._owner_id}:{key}", "region", self._owner_id, {"dimension": dimension, "bounds": protected_bounds, "participants": [self._owner_id]})
         with self._lock:
             self._god_state = self._load_state_from(self._state_path)
             landmarks = dict(self._god_state.get("landmarks", {}))
@@ -1052,6 +1202,10 @@ class GodBridge:
     def list_landmarks(self, query: str = "") -> dict[str, Any]:
         state = self.get_god_state()
         landmarks = list(state.get("landmarks", {}).values())
+        if self._owner_id:
+            shared = [dict(value["payload"]["terms"], agreement_id=value["id"], visibility="shared", confidence="agreed") for value in self._ledger.agreements_for(self._owner_id, "active") if value["kind"] == "shared_landmark"]
+            shared_ids = {value["id"] for value in shared}
+            landmarks = [value for value in landmarks if value.get("id") not in shared_ids] + shared
         query = str(query or "").strip().casefold()
         if query:
             landmarks = [item for item in landmarks if query in " ".join([
@@ -1069,7 +1223,92 @@ class GodBridge:
             removed = landmarks.pop(key, None)
             self._god_state["landmarks"] = landmarks
             self._save_state()
+        if self._owner_id:
+            self._ledger.release_resource(f"landmark:{self._owner_id}:{key}", self._owner_id)
         return {"ok": True, "removed": bool(removed), "landmark_id": key}
+
+    def propose_agreement(self, subject: str, participants: list[str], terms: dict[str, Any], kind: str = "treaty", supersedes: str = "") -> dict[str, Any]:
+        owner = self._require_owner()
+        identities = [self._resolve_player(reference)["player_id"] for reference in participants]
+        if not isinstance(terms, dict) or not terms:
+            raise ValueError("agreement terms must be a nonempty object")
+        terms = dict(terms)
+        if kind == "shared_landmark":
+            terms["id"] = landmark_key(str(terms.get("id") or subject))
+            terms["name"] = str(terms.get("name") or subject)
+            terms["dimension"] = normalize_dimension(str(terms.get("dimension", "minecraft:overworld")))
+            terms["position"] = " ".join(str(v) for v in absolute_block_position(str(terms.get("position", ""))))
+            bounds = terms.get("bounds", {})
+            if not isinstance(bounds, dict) or not {"min", "max"} <= bounds.keys():
+                raise ValueError("shared landmarks require explicit protected bounds")
+            low, high = [absolute_block_position(str(bounds[key])) for key in ["min", "max"]]
+            terms["bounds"] = {"min": " ".join(str(min(a,b)) for a,b in zip(low,high)), "max": " ".join(str(max(a,b)) for a,b in zip(low,high))}
+            terms.setdefault("aliases", [])
+            terms.setdefault("notes", "")
+        value = self._ledger.propose_agreement(owner, subject, kind, identities, terms, supersedes)
+        self._agreement_event("agreement_proposal", value)
+        return {"ok": True, "agreement": value}
+
+    def respond_agreement(self, agreement_id: str, decision: str) -> dict[str, Any]:
+        value = self._ledger.respond_agreement(agreement_id, self._require_owner(), decision)
+        self._agreement_event("agreement_response", value)
+        return {"ok": True, "agreement": value}
+
+    def _agreement_event(self, kind: str, value: dict[str, Any]) -> None:
+        self.record_event({"type": kind, "source": "god", "wake_policy": "always", "agreement_id": value["id"], "from_player_id": self._owner_id, "participant_ids": value["payload"]["participants"], "status": value["status"], "subject": value["subject"]})
+
+    @profile_transaction
+    def record_player_choice(self, choice: str, evidence: str, objective_id: str = "", approach: str = "preparation") -> dict[str, Any]:
+        if approach not in {"progress", "preparation", "incidental", "refusal", "abandonment", "alternative"}:
+            raise ValueError("unsupported choice interpretation")
+        if not choice.strip() or not evidence.strip():
+            raise ValueError("a player choice needs concrete evidence")
+        state = self.get_god_state()
+        record = {"choice": choice[:500], "evidence": evidence[:1000], "approach": approach, "objective_id": objective_id, "at": utc_now()}
+        history = state.get("player_choice_history", []) + [record]
+        updates: dict[str, Any] = {"player_choice": choice[:500], "player_choice_history": history[-24:]}
+        if objective_id:
+            objectives = state.get("story_objectives", [])
+            objective = next((item for item in objectives if item.get("id") == objective_id), None)
+            if not objective:
+                raise ValueError("unknown objective")
+            objective["last_choice"] = record
+            updates["story_objectives"] = objectives
+        self.update_god_state(updates)
+        return {"ok": True, "record": record}
+
+    def reserve_entity_tag(self, requested: str = "", idempotency_key: str = "") -> str:
+        owner = self._require_owner()
+        suffix = uuid.uuid5(uuid.NAMESPACE_OID, owner + ":" + idempotency_key).hex[:20] if idempotency_key else uuid.uuid4().hex[:20]
+        tag = requested or "god_" + suffix
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", tag):
+            raise ValueError("invalid entity ownership tag")
+        existing = self._ledger.resource("entity:" + tag)
+        if existing and existing["owner_id"] == owner and (not idempotency_key or existing["payload"].get("idempotency_key") != idempotency_key):
+            raise ValueError("entity tag is already reserved; move the existing entity or choose a new tag")
+        self._ledger.claim_resource("entity:" + tag, "entity", owner, {"tag": tag, "idempotency_key": idempotency_key})
+        return tag
+
+    @profile_transaction
+    def revise_story_objective(self, objective_id: str, reason: str, objective: dict[str, Any]) -> dict[str, Any]:
+        if not reason.strip():
+            raise ValueError("objective revisions require the player's reason or choice")
+        state = self.get_god_state()
+        previous = next((value for value in state["story_objectives"] if value["id"] == objective_id), None)
+        if not previous or previous["status"] not in {"active", "achieved_pending_judgment"}:
+            raise ValueError("only unresolved objectives may be revised")
+        replacement = dict(objective, id=objective_id)
+        self.record_player_choice(reason, "Negotiated objective revision: " + previous["description"], objective_id, "alternative")
+        result = self.set_story_objective(replacement)
+        if previous.get("watch_id") != result["objective"]["watch_id"]:
+            self.clear_story_watch(previous["watch_id"])
+        refreshed = self.get_god_state()
+        refreshed["unresolved_promises"] = [promise for promise in refreshed["unresolved_promises"] if promise != previous["description"] or promise == result["objective"]["description"]]
+        new_objective = next(item for item in refreshed["story_objectives"] if item["id"] == objective_id)
+        new_objective["revision_reason"] = reason[:1000]
+        new_objective["previous_description"] = previous["description"]
+        self.update_god_state({"unresolved_promises": refreshed["unresolved_promises"], "story_objectives": refreshed["story_objectives"]})
+        return result
 
     def observe_location(
         self,
@@ -1093,6 +1332,7 @@ class GodBridge:
             result["scene"] = scene
         return result
 
+    @profile_transaction
     def set_story_objective(self, objective: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(objective, dict):
             raise ValueError("objective must be an object")
@@ -1102,6 +1342,13 @@ class GodBridge:
             raise ValueError("objective requires a description and deterministic watch")
         objective_id = landmark_key(str(objective.get("id") or f"objective_{int(time.time())}"))
         watch = dict(watch)
+        alternatives = objective.get("alternatives", [])
+        if not isinstance(alternatives, list) or len(alternatives) > 6:
+            raise ValueError("objective alternatives must be a list of at most six described watches")
+        if alternatives:
+            if any(not isinstance(item, dict) or not isinstance(item.get("watch"), dict) or not item.get("description") for item in alternatives):
+                raise ValueError("each alternative requires a description and a deterministic watch")
+            watch = {"kind": "any", "conditions": [watch] + [item["watch"] for item in alternatives]}
         watch.setdefault("description", description)
         watch["objective_id"] = objective_id
         registered = self.register_story_watch(watch)
@@ -1113,6 +1360,9 @@ class GodBridge:
             "watch_id": registered["watch"]["id"],
             "landmark_id": str(objective.get("landmark_id", ""))[:64],
             "completion_note": str(objective.get("completion_note", ""))[:500],
+            "purpose": str(objective.get("purpose", description))[:500],
+            "alternatives": objective.get("alternatives", [])[:8],
+            "failure_policy": str(objective.get("failure_policy", "Judge deliberate choices; preparation and incidental activity are not failure."))[:500],
         }
         with self._lock:
             self._god_state = self._load_state_from(self._state_path)
@@ -1126,6 +1376,7 @@ class GodBridge:
             self._save_state()
         return {"ok": True, "objective": clean, "watch": registered["watch"]}
 
+    @profile_transaction
     def complete_story_objective(self, objective_id: str, outcome: str = "fulfilled") -> dict[str, Any]:
         key = landmark_key(objective_id)
         outcome = str(outcome or "fulfilled").strip().casefold()
@@ -1146,7 +1397,7 @@ class GodBridge:
         return {"ok": True, "objective": objective}
 
     def _turn_context(self) -> dict[str, Any]:
-        path = Path(self.config.turn_context_file)
+        path = self._absolute_path(self.config.turn_context_file)
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
             return value if isinstance(value, dict) else {}
@@ -1186,24 +1437,29 @@ class GodBridge:
         kind = str(watch.get("kind", "event")).casefold()
         if kind not in WATCH_KINDS:
             raise ValueError(f"watch kind must be one of: {', '.join(sorted(WATCH_KINDS))}")
-        clean = dict(watch)
+        clean = validate_watch(watch)
+        def normalize_watch_dimension(value):
+            if value.get("dimension"):
+                value["dimension"] = normalize_dimension(value["dimension"])
+            for condition in value.get("conditions", []):
+                normalize_watch_dimension(condition)
+        normalize_watch_dimension(clean)
         clean["kind"] = kind
-        if kind in {"all", "any"}:
-            conditions = clean.get("conditions")
-            if not isinstance(conditions, list) or not 2 <= len(conditions) <= 8:
-                raise ValueError("composite watches require 2 to 8 conditions")
-            for condition in conditions:
-                if not isinstance(condition, dict) or str(condition.get("kind", "event")).casefold() not in WATCH_KINDS - {"all", "any"}:
-                    raise ValueError("composite watch conditions must be supported non-composite watches")
         clean["id"] = str(clean.get("id") or f"watch-{int(time.time())}-{len(self.get_god_state().get('story_watches', [])) + 1}")[:128]
-        clean["created_at"] = utc_now()
+        clean["created_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         if not clean.get("description"):
             raise ValueError("watch description is required")
         with self._lock:
             self._god_state = self._load_state_from(self._state_path)
             watches = [item for item in self._god_state.get("story_watches", []) if isinstance(item, dict) and item.get("id") != clean["id"]]
             watches.append(clean)
-            self._god_state["story_watches"] = watches[-20:]
+            active_ids = {item["id"] for item in self._god_state.get("story_objectives", []) if isinstance(item, dict) and item.get("status") in {"active", "achieved_pending_judgment"}}
+            while len(watches) > 20:
+                removable = next((item for item in watches if item.get("objective_id") not in active_ids and item["id"] != clean["id"]), None)
+                if removable is None:
+                    raise ValueError("resolve an existing objective before registering another watch")
+                watches.remove(removable)
+            self._god_state["story_watches"] = watches
             self._save_state()
         return {"ok": True, "watch": clean, "watch_count": len(watches[-20:])}
 
@@ -1374,8 +1630,13 @@ class GodBridge:
         owner_id = self._require_owner()
         interaction = self._ledger.consume(request_id, owner_id)
         target = self._resolve_player(interaction["target_player_id"])
-        command = f"execute at {target['name']} run summon minecraft:lightning_bolt ~ ~ ~"
+        command = f"godsmite {target['name']}"
         result = self._execute_targeted(command, target["player_id"], capability=True)
+        if not self.config.dry_run:
+            try:
+                result["ok"] = bool(json.loads(result["output"]).get("ok"))
+            except ValueError:
+                result["ok"] = False
         result.update({"action": "approved_smite", "request_id": request_id, "target": target["name"]})
         self.record_event({
             "type": "intervention_used",
@@ -1395,10 +1656,11 @@ class GodBridge:
         if mode not in {"smite", "storm"}:
             raise ValueError("mode must be smite or storm")
         command = (
-            f"execute at {player} run summon minecraft:lightning_bolt ~ ~ ~"
+            f"godsmite {player}"
             if mode == "smite" else "weather thunder 120"
         )
-        result = self.action("punish_player", lambda: command)
+        result = self.execute(command, capability=mode == "smite")
+        result["action"] = "punish_player"
         if result.get("ok"):
             with self._lock:
                 self._god_state = self._load_state_from(self._state_path)
@@ -1414,7 +1676,7 @@ class GodBridge:
 
     def structure_library(self) -> StructureLibrary:
         return StructureLibrary(
-            Path(__file__).resolve().parents[1],
+            workspace_root(),
             catalog_file=self.config.structure_catalog_file,
             datapacks_dir=self.config.structure_datapacks_dir,
             download_dir=self.config.structure_download_dir,
@@ -1432,8 +1694,8 @@ class GodBridge:
         if self.config.dry_run:
             return {"ok": True, "dry_run": True, "project_id": project_id, "version_id": version_id, "structures": []}
         result = self.structure_library().import_modrinth(project_id, version_id, namespace)
-        enable = self.execute(f'datapack enable "file/{result["pack_name"]}"', record=False)
-        reload_result = self.execute("reload", record=False) if enable["ok"] else {"ok": False, "error": "datapack was not enabled"}
+        enable = self.execute(f'datapack enable "file/{result["pack_name"]}"', record=False, capability=True)
+        reload_result = self.execute("reload", record=False, capability=True) if enable["ok"] else {"ok": False, "error": "datapack was not enabled"}
         result["activation"] = {"enable": enable, "reload": reload_result}
         result["ok"] = bool(result.get("ok") and enable.get("ok") and reload_result.get("ok"))
         return result
@@ -1458,7 +1720,24 @@ class GodBridge:
         else:
             block_position = self.resolve_block_position(position)
         size = entry.get("size", []) if entry else []
-        preflight = self._structure_preflight(block_position, size, dimension) if size and not self.config.dry_run else {"ok": None, "status": "not-run"}
+        footprint_origin, footprint_size = block_position, size
+        if len(size) == 3:
+            if any(int(value) < 1 for value in size):
+                raise ValueError("structure dimensions must be positive")
+            corners = [_rotate_structure_position([x, y, z], size, rotation) for x in [0, int(size[0])-1] for y in [0, int(size[1])-1] for z in [0, int(size[2])-1]]
+            minimum = [min(corner[i] for corner in corners) for i in range(3)]
+            maximum = [max(corner[i] for corner in corners) for i in range(3)]
+            footprint_origin = tuple(block_position[i] + minimum[i] for i in range(3))
+            footprint_size = [maximum[i] - minimum[i] + 1 for i in range(3)]
+        if self._owner_id:
+            if len(size) < 3:
+                raise PermissionError("scoped structure placement requires imported size metadata to check its full protected footprint")
+            if not entry.get("scoped_safe"):
+                raise PermissionError("reimport a template without command-bearing blocks or embedded entities; summon owned entities separately")
+            start = [str(v) for v in footprint_origin]
+            end = [str(footprint_origin[i] + footprint_size[i] - 1) for i in range(3)]
+            check_world_bounds(self, start, end, dimension, not bool(dimension))
+        preflight = self._structure_preflight(footprint_origin, footprint_size, dimension) if size and not self.config.dry_run else {"ok": None, "status": "not-run"}
         if preflight.get("ok") is False:
             return {
                 "ok": False,
@@ -1469,10 +1748,11 @@ class GodBridge:
                 "error": "Structure placement refused because the inspected footprint is unsafe or occupied.",
             }
         command_position = parse_position(position)
-        command = f"place template {structure} {command_position} {rotation}"
+        command_rotation = "180" if rotation == "clockwise_180" else rotation
+        command = f"place template {structure} {command_position} {command_rotation}"
         if dimension:
             command = f"execute in {dimension} run {command}"
-        elif "~" in command_position:
+        else:
             command = self.command_at_player(command)
         if preview:
             return {
@@ -1505,9 +1785,14 @@ class GodBridge:
                 continue
             rotated = _rotate_structure_position(raw_pos, size, rotation)
             target = tuple(block_position[index] + rotated[index] for index in range(3))
-            check = self.inspect_block(f"{target[0]} {target[1]} {target[2]}", dimension)
-            actual = str(check.get("block", {}).get("type", ""))
-            samples.append({"position": target, "expected": block_name, "result": check, "matched": actual == block_name})
+            samples.append({"position": target, "expected": block_name})
+        if samples:
+            batch = self.inspect_blocks([" ".join(str(value) for value in sample["position"]) for sample in samples], dimension)
+            checks = batch.get("results", [])
+            for index, sample in enumerate(samples):
+                check = checks[index] if index < len(checks) else {"ok": False}
+                sample["result"] = check
+                sample["matched"] = check.get("ok") and check.get("block", {}).get("type") == sample["expected"]
         result["size"] = size
         result["verification"] = {"ok": bool(samples) and all(item["matched"] for item in samples), "samples": samples}
         result["ok"] = bool(result["ok"] and result["verification"]["ok"])
@@ -1530,8 +1815,11 @@ class GodBridge:
             (x + sx // 2, y + sy - 1, z + sz // 2),
         }
         checks: list[dict[str, Any]] = []
-        for point in sorted(points):
-            inspected = self.inspect_block(f"{point[0]} {point[1]} {point[2]}", dimension)
+        ordered = sorted(points)
+        batch = self.inspect_blocks([" ".join(str(v) for v in point) for point in ordered], dimension)
+        results = batch.get("results", [])
+        for index, point in enumerate(ordered):
+            inspected = results[index] if index < len(results) else {"ok": False, "error": batch.get("error", "missing batch result")}
             checks.append({"position": point, "result": inspected})
             if not inspected.get("ok"):
                 return {"ok": False, "reason": "exact block inspection failed", "checks": checks}
@@ -1577,6 +1865,9 @@ def looks_like_command_failure(output: str) -> bool:
             "failed to",
             "invalid argument",
             "permission",
+            "not loaded",
+            "outside of the world",
+            "no blocks were filled",
         )
     )
 
@@ -1592,14 +1883,12 @@ def _resolve_coordinate(token: str, base: float, *, block: bool) -> int | float:
 def _rotate_structure_position(position: list[Any], size: list[Any], rotation: str) -> tuple[int, int, int]:
     """Rotate a structure-local block position around its template origin."""
     x, y, z = (int(position[0]), int(position[1]), int(position[2]))
-    sx = int(size[0]) if len(size) > 0 else 0
-    sz = int(size[2]) if len(size) > 2 else 0
     if rotation == "clockwise_90":
-        return sz - 1 - z, y, x
+        return -z, y, x
     if rotation == "clockwise_180":
-        return sx - 1 - x, y, sz - 1 - z
+        return -x, y, -z
     if rotation == "counterclockwise_90":
-        return z, y, sx - 1 - x
+        return z, y, -x
     return x, y, z
 
 

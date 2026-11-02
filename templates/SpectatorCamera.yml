@@ -1,0 +1,90 @@
+# Safe, on-demand configuration for the private god camera.
+camera-mode: "bot"
+camera-nick: "GodCamera"
+
+assets:
+  download-client-jar-on-first-run: true
+  client-version: "auto"
+
+bot:
+  keep-spectator: true
+  invulnerable: true
+  invisible: true
+
+tab-list:
+  enabled: false
+
+chunk-loading:
+  keep-near-camera-when-empty: true
+  radius-chunks: 8
+
+interesting-places:
+  enabled: false
+
+streaming:
+  enabled: false
+  local-preview:
+    enabled: false
+    port: 25573
+    width: 900
+    height: 650
+    fps: 1
+    internal-scale: 1.0
+    max-distance: 160
+  effects:
+    old-camera:
+      enabled: false
+      noise: 0.0
+      scanlines: 0.0
+      vignette: 0.0
+      warmth: 0.0
+      jitter: 0.0
+  audio:
+    enabled: false
+    file: ""
+    volume: 0.0
+  twitch:
+    enabled: false
+    bitrate-kbps: 6000
+    ffmpeg-path: "auto"
+    auto-download-ffmpeg: false
+    ffmpeg-directory: "ffmpeg"
+    download-url: ""
+    checksum-sha256: ""
+    download-timeout-seconds: 30
+    rtmp-url: ""
+    stream-key: ""
+    auto-reconnect: false
+    reconnect-interval-seconds: 10
+  video:
+    width: 900
+    height: 650
+    fps: 1
+    bitrate-kbps: 1000
+  renderer:
+    render-distance-chunks: 8
+    vertical-range: 48
+    max-distance: 128
+    live-snapshot-radius-blocks: 128
+    live-snapshot-interval-ticks: 20
+    fov-degrees: 70.0
+    control-endpoint: "ws://127.0.0.1:25590"
+    assets-directory: "minecraft-assets"
+    vanilla-client-jar: "client.jar"
+
+logging:
+  camera:
+    enabled: false
+
+afk-threshold-seconds: 3600
+player-switch-interval-ms: 86400000
+switch-interval:
+  min-ms: 86400000
+  max-ms: 86400000
+move-trigger-distance: 1000000.0
+
+hub-location:
+  world: "world"
+  x: 0.0
+  y: 100.0
+  z: 0.0

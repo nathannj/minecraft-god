@@ -1,0 +1,22 @@
+name: Bug report
+description: Report a reproducible problem with setup or gameplay.
+body:
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: What happened, and how can we reproduce it?
+      description: Include the steps, expected result, and actual result. Use a disposable world for reproduction.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Versions and diagnostics
+      description: Include operating system, Python, Java, Codex CLI, Paper build, and doctor output. Remove player names, chat, credentials, and personal paths.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Minimal redacted evidence
+      description: A small error excerpt or synthetic replay is usually enough. Do not attach the state, logs, server, or .codex-runtime folders.

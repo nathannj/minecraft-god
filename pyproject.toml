@@ -1,17 +1,37 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "minecraft-god-bridge"
 version = "0.1.0"
 description = "A local MCP bridge that gives Codex controlled supernatural access to a Minecraft server."
+readme = "README.md"
+license = "ISC"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "third_party/*.txt"]
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest==9.1.1", "build==1.6.1", "ruff==0.17.0"]
+audit = ["pip-audit==2.10.1"]
+voice = ["faster-whisper==1.2.1", "av==16.0.1"]
+
 [project.scripts]
 minecraft-god = "god_bridge.mcp_server:main"
+minecraft-god-replay = "god_bridge.replay:main"
+minecraft-god-demo = "god_bridge.demo:main"
+minecraft-god-doctor = "god_bridge.doctor:main"
+
+[tool.setuptools.packages.find]
+include = ["god_bridge*"]
+
+[tool.setuptools.package-data]
+god_bridge = ["god_system.md", "demo_scenario.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+select = ["F", "E9"]
 

@@ -1,0 +1,25 @@
+{
+  "description": "Synthetic replay: return a blaze rod to a remembered library.",
+  "player": "Alice",
+  "player_id": "a0d35179-5ead-4e3a-bef9-cdbb03bf306d",
+  "state": {
+    "story_phase": "active",
+    "story_objectives": [{"id": "library-vow", "status": "active", "title": "Return a blaze rod to the library"}],
+    "story_watches": [{
+      "id": "library-watch", "created_at": "demo-v1", "objective_id": "library-vow", "kind": "all",
+      "conditions": [
+        {"kind": "region", "dimension": "minecraft:overworld", "position": "10 64 10", "radius": 2},
+        {"kind": "item", "item": "minecraft:blaze_rod", "amount": 1}
+      ]
+    }]
+  },
+  "events": [
+    {"type": "player_prayer", "player": "Alice", "player_uuid": "a0d35179-5ead-4e3a-bef9-cdbb03bf306d", "message": "I am on my way back to the library."},
+    {"type": "block_break", "player": "Alice", "player_uuid": "a0d35179-5ead-4e3a-bef9-cdbb03bf306d", "dimension": "minecraft:overworld", "position": "40 64 40", "block": "minecraft:stone", "wake_policy": "never"},
+    {"type": "player_snapshot", "player": "Bob", "player_uuid": "73fb35c3-f167-413e-a550-c285baf7c936", "dimension": "minecraft:overworld", "position": "10 64 10", "inventory": {"minecraft:blaze_rod": 1}},
+    {"type": "player_snapshot", "player": "Alice", "player_uuid": "a0d35179-5ead-4e3a-bef9-cdbb03bf306d", "dimension": "minecraft:the_nether", "position": "10 64 10", "inventory": {"minecraft:blaze_rod": 1}},
+    {"type": "player_snapshot", "player": "Alice", "player_uuid": "a0d35179-5ead-4e3a-bef9-cdbb03bf306d", "dimension": "minecraft:overworld", "position": "40 64 40", "inventory": {"minecraft:blaze_rod": 1}},
+    {"type": "player_snapshot", "player": "Alice", "player_uuid": "a0d35179-5ead-4e3a-bef9-cdbb03bf306d", "dimension": "minecraft:overworld", "position": "10 64 10", "inventory": {"minecraft:blaze_rod": 1}},
+    {"type": "player_snapshot", "player": "Alice", "player_uuid": "a0d35179-5ead-4e3a-bef9-cdbb03bf306d", "dimension": "minecraft:overworld", "position": "10 64 10", "inventory": {"minecraft:blaze_rod": 1}}
+  ]
+}

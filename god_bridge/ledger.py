@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .pantheon import PantheonRecords
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -31,7 +33,7 @@ def _decode(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return result
 
 
-class GodLedger:
+class GodLedger(PantheonRecords):
     """Cross-process registry and capability ledger."""
 
     def __init__(self, path: str | Path) -> None:
@@ -39,6 +41,7 @@ class GodLedger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._initialize()
+        self.initialize_pantheon()
 
     def _connection(self) -> sqlite3.Connection:
         connection = getattr(self._local, "connection", None)
@@ -108,6 +111,10 @@ class GodLedger:
                 result_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS event_log (
+                event_id INTEGER PRIMARY KEY,
+                event_json TEXT NOT NULL
+            );
             """
         )
 
@@ -126,7 +133,8 @@ class GodLedger:
             connection.execute("COMMIT")
             return current
         except Exception:
-            connection.execute("ROLLBACK")
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
             raise
 
     def reserve_event(
@@ -166,12 +174,28 @@ class GodLedger:
                     "INSERT INTO event_dedup(dedupe_key, event_id, event_json) VALUES (?, ?, ?)",
                     (dedupe_key, current, json.dumps(clean, separators=(",", ":"))),
                 )
+            connection.execute("INSERT INTO event_log VALUES (?, ?)", (current, json.dumps(clean, separators=(",", ":"))))
             connection.execute("COMMIT")
             return clean, True
         except Exception:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
+
+    def events_since(self, event_id: int, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self._connection().execute("SELECT event_json FROM event_log WHERE event_id>? ORDER BY event_id LIMIT ?", (event_id, max(1, min(limit, 200)))).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def recent_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self._connection().execute(
+            "SELECT event_json FROM event_log ORDER BY event_id DESC LIMIT ?",
+            (max(1, min(limit, 200)),),
+        ).fetchall()
+        return [json.loads(row[0]) for row in reversed(rows)]
+
+    def latest_event_id(self) -> int:
+        row = self._connection().execute("SELECT value FROM sequences WHERE name='events'").fetchone()
+        return int(row[0]) if row else 0
 
     def cached_action(self, idempotency_key: str) -> dict[str, Any] | None:
         row = self._connection().execute(
@@ -203,7 +227,8 @@ class GodLedger:
         )
 
     def register_player(self, player_id: str, name: str, *, online: bool = True) -> dict[str, Any]:
-        player_id = str(player_id).strip().lower()
+        from .runtime import player_id as validate_player_id
+        player_id = validate_player_id(player_id)
         name = str(name).strip()
         if not player_id or not name:
             raise ValueError("player_id and name are required")

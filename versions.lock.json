@@ -1,0 +1,63 @@
+{
+  "python_minimum": "3.11",
+  "codex_cli": "0.151.0",
+  "minecraft": "26.2",
+  "paper_build": 133,
+  "paper_api": "26.2.build.133-stable",
+  "paper": {
+    "url": "https://fill-data.papermc.io/v1/objects/bf1dcf627364f8a631ab15250d240eb5a8e89faaac523b391e1c61367fce9ff1/paper-26.2-133.jar",
+    "sha256": "bf1dcf627364f8a631ab15250d240eb5a8e89faaac523b391e1c61367fce9ff1"
+  },
+  "java": {
+    "version": "25.0.4.10.1",
+    "url": "https://corretto.aws/downloads/resources/25.0.4.10.1/amazon-corretto-25.0.4.10.1-windows-x64-jdk.zip",
+    "sha256": "7055981aeda6927cfa4c8bedd619eb6809b923c47dbfd42441a70d47c3235e71"
+  },
+  "gradle": {
+    "version": "9.1.0",
+    "url": "https://services.gradle.org/distributions/gradle-9.1.0-bin.zip",
+    "sha256": "a17ddd85a26b6a7f5ddb71ff8b05fc5104c0202c6e64782429790c933686c806"
+  },
+  "camera": {
+    "version": "2.0.9",
+    "url": "https://cdn.modrinth.com/data/ZBC8eO4p/versions/xOL4O91X/SpectatorCamera-v2.0.9.jar",
+    "sha512": "4758b1e7e607fd7b43e2146a361644f081aea04b63e8eb8164119eb982aa0852d521bb55e0a5068bb6c3b32d956aa4e360a6695715d0052d7e49880045decf40"
+  },
+  "voicechat": {
+    "version": "bukkit-2.6.27",
+    "url": "https://cdn.modrinth.com/data/9eGKb6K1/versions/3Br8wxJY/voicechat-bukkit-2.6.27.jar",
+    "sha512": "9d55c64e79289da87b6c51295124477b4061f5820bd68370c1f6b82137c7ca19d5db7bc05828f12091f23c6ddf1b328b8c5018d4df85fa7c3ddacc6f8f114abe",
+    "filename": "voicechat-bukkit-2.6.27.jar"
+  },
+  "voicechat_client": {
+    "version": "fabric-2.6.27+26.2",
+    "url": "https://cdn.modrinth.com/data/9eGKb6K1/versions/ul3tRpKz/voicechat-fabric-2.6.27%2B26.2.jar",
+    "sha512": "d3c0d7c57138457a16af6dff8e15cd664471647e7697f66a53b62b953b9c778af217170a3284b0b606d1ec4dbfb74936fd95b23469d90fd5afa4c1db82e5b6d7",
+    "filename": "voicechat-fabric-2.6.27+26.2.jar"
+  },
+  "minimap": {
+    "version": "fabric-26.2-26.6.2",
+    "url": "https://cdn.modrinth.com/data/1bokaNcj/versions/kYWdcLLn/xaerominimap-fabric-26.2-26.6.2.jar",
+    "sha512": "2833304ed48fa7e44d3cb7ad4e95b94aeda638332aff38e8476393b78eb676d898130edae2bd1a45984393ed426d2fa44ebe04f8959571c2c9cdc965d70e2489",
+    "filename": "xaerominimap-fabric-26.2-26.6.2.jar"
+  },
+  "worldmap": {
+    "version": "fabric-26.2-1.47.2",
+    "url": "https://cdn.modrinth.com/data/NcUtCpym/versions/W8qSt5Gs/xaeroworldmap-fabric-26.2-1.47.2.jar",
+    "sha512": "0ea2501a0cc1085a4540c5af49674ce420314f3e725acd1b8f458be71526ac331c04c3eb65c443cd3c1ef24a397856b33b8a567f8eecf4c80bbfbff03258eb70",
+    "filename": "xaeroworldmap-fabric-26.2-1.47.2.jar"
+  },
+  "fabric_api": {
+    "version": "0.161.0+26.2",
+    "url": "https://cdn.modrinth.com/data/P7dR8mSH/versions/ewUK83HI/fabric-api-0.161.0%2B26.2.jar",
+    "sha512": "2502fa5ade78e9a120b3747bc1a9a2167d6671743bea45bf115d3174c94121aeda87c549446d1a604a9c11fb828de17a551e3514ce42f3e93069dd14bdaee55b",
+    "filename": "fabric-api-0.161.0+26.2.jar"
+  },
+  "xaero_tracker": {
+    "version": "1.4.0",
+    "url": "https://github.com/inf-mc/XaeroTracker/releases/download/v1.4.0/XaeroTracker-1.4.0-all.jar",
+    "sha256": "4634426bad47da153b49690db5d90e0db6d4294ce25f6f42cf8d0bab112f6573",
+    "filename": "XaeroTracker.jar"
+  },
+  "fabric_loader": "0.19.5"
+}

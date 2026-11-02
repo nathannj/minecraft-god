@@ -8,6 +8,8 @@ $PasswordFile = Join-Path $Root "server\rcon-password.txt"
 $LedgerFile = Join-Path $Root "state\god_ledger.sqlite3"
 $ReadyFile = Join-Path $Root "logs\god-controller.ready"
 $LockFile = Join-Path $Root "logs\god-controller.lock"
+. (Join-Path $Root "scripts\runtime.ps1")
+Set-Location $Root
 
 function Test-ContainsLiteral {
     param([string]$Text, [string]$Value)
@@ -18,7 +20,7 @@ function Test-AiGodProcess {
     param($Process)
     $command = [string]$Process.CommandLine
     if (-not $command) { return $false }
-    if ($command -match '(?i)(?:^|\s)god_bridge\.(?:controller|event_hub)(?:\s|$)') { return $true }
+    if (Test-ProjectRuntimeProcess $Process) { return $true }
     if ((Test-ContainsLiteral $command (Join-Path $Root "run_bridge.py"))) { return $true }
     if ((Test-ContainsLiteral $command (Join-Path $Root "start-minecraft-god.ps1"))) { return $true }
     if ((Test-ContainsLiteral $command (Join-Path $Root "launch-minecraft-god.cmd"))) { return $true }
@@ -98,7 +100,7 @@ if ($rconRequested) {
 # Stop AI usage promptly, even if Paper is still finishing its disk flush.
 $aiProcesses = @(Get-AiGodProcesses | Where-Object {
     $command = [string]$_.CommandLine
-    $command -match '(?i)(?:^|\s)god_bridge\.controller(?:\s|$)' -or
+    (Test-ContainsLiteral $command (Join-Path $Root "run_controller.py")) -or
     (Test-ContainsLiteral $command (Join-Path $Root "run_bridge.py"))
 })
 Stop-AiGodProcessTrees $aiProcesses "stop the God controller, Codex sessions, and MCP bridges"

@@ -72,7 +72,7 @@ class RconClient:
         while sentinel_id == request_id:
             sentinel_id = random.randint(1, 2_000_000_000)
         sock.sendall(encode_packet(request_id, SERVERDATA_EXECCOMMAND, command))
-        sock.sendall(encode_packet(sentinel_id, SERVERDATA_EXECCOMMAND, "list"))
+        sentinel_sent = False
 
         chunks: list[str] = []
         while True:
@@ -91,6 +91,12 @@ class RconClient:
                 break
             if response.request_id == request_id:
                 chunks.append(response.body)
+                if not sentinel_sent:
+                    # Paper's input reader can reject two requests coalesced
+                    # into one TCP read. Wait for the command's first response
+                    # before sending the marker, preserving response ordering.
+                    sock.sendall(encode_packet(sentinel_id, SERVERDATA_EXECCOMMAND, "list"))
+                    sentinel_sent = True
         return RconResponse(request_id, SERVERDATA_RESPONSE_VALUE, "".join(chunks))
 
     def command(self, command: str) -> RconResponse:

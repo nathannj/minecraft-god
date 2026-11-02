@@ -29,13 +29,13 @@ def test_god_actions_build_expected_commands(tmp_path):
     bridge, rcon = make_bridge(tmp_path)
     result = call_tool(bridge, "spawn_entity", {"entity_type": "minecraft:warden", "position": "~ ~ ~"})
     assert result["ok"] is True
-    assert rcon.commands == ["execute as IAmBoreder at @s run summon minecraft:warden ~ ~ ~"]
+    assert rcon.commands == ["execute as Player at @s run summon minecraft:warden ~ ~ ~"]
 
     call_tool(bridge, "god_say", {"message": "You misunderstand."})
-    assert rcon.commands[-1].startswith("tellraw IAmBoreder ")
+    assert rcon.commands[-1].startswith("tellraw Player ")
     call_tool(bridge, "broadcast_to_world", {"message": "The skies open."})
     assert rcon.commands[-1].startswith("tellraw @a ")
-    assert "God of IAmBoreder" in rcon.commands[-1]
+    assert "God of Player" in rcon.commands[-1]
 
 
 def test_god_state_persists(tmp_path):
@@ -133,7 +133,7 @@ def test_active_player_overrides_fallback_for_default_actions(tmp_path):
         BridgeConfig(
             state_file=str(tmp_path / "state.json"),
             active_player_file=str(active_file),
-            player_name="IAmBoreder",
+            player_name="Player",
         ),
         rcon=FakeRcon(),
     )
@@ -146,7 +146,7 @@ def test_active_player_overrides_fallback_for_default_actions(tmp_path):
 
 def test_event_and_chat_buffers(tmp_path):
     bridge, _ = make_bridge(tmp_path, dry_run=True)
-    bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "god please give me food"})
+    bridge.record_event({"type": "chat", "player": "Player", "message": "god please give me food"})
     bridge.record_event({"type": "creeper_explosion", "position": "1 2 3"})
     assert bridge.read_chat(10)[0]["message"] == "god please give me food"
     assert len(bridge.recent_events(10)) == 2
@@ -183,7 +183,7 @@ def test_minecraft_failure_text_is_not_reported_as_success(tmp_path):
 def test_relative_block_action_is_anchored_to_active_player(tmp_path):
     bridge, rcon = make_bridge(tmp_path)
     call_tool(bridge, "set_block", {"block": "minecraft:blue_wool", "position": "~ ~-1 ~"})
-    assert rcon.commands == ["execute as IAmBoreder at @s run setblock ~ ~-1 ~ minecraft:blue_wool"]
+    assert rcon.commands == ["execute as Player at @s run setblock ~ ~-1 ~ minecraft:blue_wool"]
 
 
 def test_place_sign_builds_text_component_strings_and_verifies(tmp_path):
@@ -210,19 +210,19 @@ def test_place_sign_rejects_lines_that_do_not_fit_the_physical_sign(tmp_path):
 
 def test_sustained_abuse_triggers_an_immediate_consequence(tmp_path):
     bridge, rcon = make_bridge(tmp_path)
-    bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "god, you fuckwit"})
-    bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "god, you pussy"})
-    event = bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "god, you retard"})
+    bridge.record_event({"type": "chat", "player": "Player", "message": "god, you fuckwit"})
+    bridge.record_event({"type": "chat", "player": "Player", "message": "god, you pussy"})
+    event = bridge.record_event({"type": "chat", "player": "Player", "message": "god, you retard"})
 
     assert event["conduct"]["automatic_consequence"] is True
-    assert any("summon minecraft:lightning_bolt" in command for command in rcon.commands)
+    assert any(command == "godsmite Player" for command in rcon.commands)
     assert bridge.get_god_state()["consequence_count"] == 1
 
 
 def test_ordinary_profanity_not_directed_at_god_does_not_trigger_consequence(tmp_path):
     bridge, rcon = make_bridge(tmp_path)
     for _ in range(4):
-        bridge.record_event({"type": "chat", "player": "IAmBoreder", "message": "this fucking cave is awful"})
+        bridge.record_event({"type": "chat", "player": "Player", "message": "this fucking cave is awful"})
     assert not any("lightning_bolt" in command for command in rcon.commands)
 
 
@@ -264,7 +264,7 @@ def test_capture_scene_returns_private_visual_views(tmp_path):
             self.commands.append(command)
             if command.startswith("godscan "):
                 return type("Response", (), {"body": json.dumps({
-                    "player": "IAmBoreder",
+                    "player": "Player",
                     "dimension": "minecraft:overworld",
                     "block_position": "0 64 0",
                     "blocks": [
@@ -313,7 +313,7 @@ def test_event_http_round_trip(tmp_path):
     server = start_event_server(bridge)
     try:
         base = f"http://127.0.0.1:{server.server_port}"
-        request = Request(f"{base}/events", data=json.dumps({"type": "player_join", "player": "IAmBoreder"}).encode(), headers={"Content-Type": "application/json"}, method="POST")
+        request = Request(f"{base}/events", data=json.dumps({"type": "player_join", "player": "Player", "player_uuid": str(uuid.uuid4())}).encode(), headers={"Content-Type": "application/json"}, method="POST")
         with urlopen(request) as response:
             assert response.status == 202
         with urlopen(f"{base}/events?after=0") as response:
@@ -356,7 +356,7 @@ def test_scoped_bridge_ignores_shared_legacy_state_and_active_player(tmp_path):
     alice_id = str(uuid.uuid4())
     bob_id = str(uuid.uuid4())
     legacy_state = tmp_path / "god_state.json"
-    legacy_state.write_text(json.dumps({"current_interest": "IAmBoreder's shrine vow"}), encoding="utf-8")
+    legacy_state.write_text(json.dumps({"current_interest": "Player's shrine vow"}), encoding="utf-8")
     active_file = tmp_path / "active_player.txt"
     active_file.write_text("Bob", encoding="utf-8")
     bridge, rcon = scoped_bridge(tmp_path, alice_id, "Alice")
@@ -412,7 +412,7 @@ def test_intervention_requires_target_god_approval_and_is_one_use(tmp_path):
     assert approved["request"]["status"] == "approved"
     result = alice.use_intervention(request_id)
     assert result["action"] == "approved_smite"
-    assert any("execute at Bob run summon minecraft:lightning_bolt" in command for command in alice_rcon.commands)
+    assert "godsmite Bob" in alice_rcon.commands
     with pytest.raises(PermissionError):
         alice.use_intervention(request_id)
 

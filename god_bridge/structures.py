@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import json
 import re
 import struct
-import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -32,7 +32,7 @@ class StructureLibrary:
         self,
         workspace: Path,
         catalog_file: str = "state/structure_catalog.json",
-        datapacks_dir: str = "server/world/datapacks",
+        datapacks_dir: str = "world/datapacks",
         download_dir: str = "state/structure_downloads",
         max_download_mb: int = 64,
         game_version: str = "26.2",
@@ -183,11 +183,14 @@ class StructureLibrary:
             raise ValueError(f"download {algorithm} checksum did not match Modrinth metadata")
 
     def _extract_structures(self, source: Path, pack_dir: Path, namespace: str) -> tuple[list[dict[str, Any]], bytes | None]:
+        if not re.fullmatch(r"[a-z0-9_-]+", namespace):
+            raise ValueError("invalid structure namespace")
         if source.suffix.lower() == ".nbt":
-            target = pack_dir / "data" / namespace / "structures" / source.stem.lower()
+            name = _safe_name(source.stem)
+            target = pack_dir / "data" / namespace / "structure" / (name + ".nbt")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.with_suffix(".nbt").write_bytes(source.read_bytes())
-            return [_entry_from_nbt(target, f"{namespace}:{source.stem.lower()}", source.name)], None
+            target.write_bytes(source.read_bytes())
+            return [_entry_from_nbt(target, f"{namespace}:{name}", source.name)], None
 
         entries: list[dict[str, Any]] = []
         pack_meta = None
@@ -211,9 +214,11 @@ class StructureLibrary:
                 if not lowered[-1].endswith(".nbt"):
                     continue
                 relative = PurePosixPath(*safe_parts[data_index + 3:])
+                if not re.fullmatch(r"[a-z0-9_./-]+\.nbt", relative.as_posix()):
+                    continue
                 if any(part in {"", ".", ".."} for part in relative.parts):
                     continue
-                target = pack_dir / "data" / namespace / "structures" / relative
+                target = pack_dir / "data" / namespace / "structure" / relative
                 target = target.with_suffix(".nbt")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(archive.read(info))
@@ -229,14 +234,28 @@ def _entry_from_nbt(path: Path, structure_id: str, source_name: str) -> dict[str
 
 def read_structure_metadata(path: Path) -> dict[str, Any]:
     """Read only safe descriptive data; never edits the structure NBT."""
+    maximum = 32 * 1024 * 1024
+    if path.stat().st_size > maximum:
+        raise ValueError("structure NBT exceeds 32 MiB")
     raw = path.read_bytes()
     if raw[:2] == b"\x1f\x8b":
-        raw = gzip.decompress(raw)
-    root = _read_nbt(raw)
+        with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
+            raw = stream.read(maximum + 1)
+    if len(raw) > maximum:
+        raise ValueError("decompressed structure NBT exceeds 32 MiB")
+    try:
+        root = _read_nbt(raw)
+    except (IndexError, struct.error, UnicodeError) as error:
+        raise ValueError("structure NBT is truncated or malformed") from error
     size = root.get("size", []) if isinstance(root, dict) else []
     blocks = root.get("blocks", []) if isinstance(root, dict) else []
     palette = root.get("palette", []) if isinstance(root, dict) else []
     samples = []
+    entities = root.get("entities", [])
+    unsafe_blocks = {"minecraft:command_block", "minecraft:chain_command_block", "minecraft:repeating_command_block", "minecraft:structure_block", "minecraft:jigsaw"}
+    scoped_safe = not entities and not any(item.get("Name") in unsafe_blocks for item in palette if isinstance(item, dict))
+    if re.search(r'"(?:Command|SpawnData|SpawnPotentials|EntityTag|BlockEntityTag)"\s*:', json.dumps(root)):
+        scoped_safe = False
     if isinstance(blocks, list) and isinstance(palette, list):
         for block in blocks:
             if not isinstance(block, dict) or not isinstance(block.get("pos"), list):
@@ -248,7 +267,7 @@ def read_structure_metadata(path: Path) -> dict[str, Any]:
                 block_name = ""
             if block_name and block_name != "minecraft:air" and len(samples) < 12:
                 samples.append({"position": block["pos"], "block": block_name})
-    return {"size": size if isinstance(size, list) and len(size) == 3 else [], "samples": samples}
+    return {"size": size if isinstance(size, list) and len(size) == 3 else [], "samples": samples, "scoped_safe": scoped_safe, "entity_count": len(entities)}
 
 
 def _read_nbt(raw: bytes) -> dict[str, Any]:
@@ -265,7 +284,9 @@ def _read_nbt(raw: bytes) -> dict[str, Any]:
     return value
 
 
-def _read_payload(raw: bytes, position: int, tag_type: int) -> tuple[Any, int]:
+def _read_payload(raw: bytes, position: int, tag_type: int, depth: int = 0) -> tuple[Any, int]:
+    if depth > 64:
+        raise ValueError("structure NBT nesting exceeds 64 levels")
     if tag_type == 1:
         return struct.unpack_from(">b", raw, position)[0], position + 1
     if tag_type == 2:
@@ -280,18 +301,24 @@ def _read_payload(raw: bytes, position: int, tag_type: int) -> tuple[Any, int]:
         return struct.unpack_from(">d", raw, position)[0], position + 8
     if tag_type == 7:
         length = struct.unpack_from(">i", raw, position)[0]
+        if length < 0 or position + 4 + length > len(raw):
+            raise ValueError("invalid NBT byte array length")
         return raw[position + 4:position + 4 + length], position + 4 + length
     if tag_type == 8:
         length = struct.unpack_from(">H", raw, position)[0]
         end = position + 2 + length
+        if end > len(raw):
+            raise ValueError("invalid NBT string length")
         return raw[position + 2:end].decode("utf-8"), end
     if tag_type == 9:
         child_type = raw[position]
         length = struct.unpack_from(">i", raw, position + 1)[0]
+        if not 0 <= length <= min(262144, len(raw) - position - 5):
+            raise ValueError("invalid or excessive NBT list length")
         position += 5
         values = []
         for _ in range(max(0, length)):
-            value, position = _read_payload(raw, position, child_type)
+            value, position = _read_payload(raw, position, child_type, depth + 1)
             values.append(value)
         return values, position
     if tag_type == 10:
@@ -303,12 +330,14 @@ def _read_payload(raw: bytes, position: int, tag_type: int) -> tuple[Any, int]:
             position += 2
             name = raw[position:position + name_length].decode("utf-8")
             position += name_length
-            result[name], position = _read_payload(raw, position, child_type)
+            result[name], position = _read_payload(raw, position, child_type, depth + 1)
         return result, position + 1
     if tag_type in {11, 12}:
         length = struct.unpack_from(">i", raw, position)[0]
         width = 4 if tag_type == 11 else 8
         end = position + 4 + max(0, length) * width
+        if length < 0 or end > len(raw):
+            raise ValueError("invalid NBT array length")
         return [], end
     raise ValueError(f"unsupported NBT tag type {tag_type}")
 
