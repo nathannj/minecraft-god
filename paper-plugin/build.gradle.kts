@@ -12,9 +12,9 @@ repositories {
 }
 
 dependencies {
-    compileOnly("io.papermc.paper:paper-api:26.2.build.133-stable")
+    compileOnly("io.papermc.paper:paper-api:26.3.build.244-stable")
     compileOnly("de.maxhenkel.voicechat:voicechat-api:2.6.27")
-    testImplementation("io.papermc.paper:paper-api:26.2.build.133-stable")
+    testImplementation("io.papermc.paper:paper-api:26.3.build.244-stable")
     testImplementation("de.maxhenkel.voicechat:voicechat-api:2.6.27")
 }
 
